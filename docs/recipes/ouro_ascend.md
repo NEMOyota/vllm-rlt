@@ -72,6 +72,25 @@ currently unsupported on this path.
 
 ### Local prefix-cache experiment
 
+For the 910B2 experiment, export the assigned `ASCEND_RT_VISIBLE_DEVICES` and
+set `MODEL` to the absolute path of the local Ouro-1.4B checkpoint and tokenizer.
+Run the following commands from the repository root in your existing CANN 9.0.0,
+Torch 2.9.0 and Torch-NPU 2.9.0 environment. Run the tests on an idle card first.
+
+~~~bash
+bash docs/recipes/ascend_prefix_910b2.sh test
+bash docs/recipes/ascend_prefix_910b2.sh serve
+~~~
+
+Once the server is listening, use a second shell to check health and send two
+requests with a shared prefix. Both should complete with eight tokens. The
+`test` command reports token parity, cache hits and engine TTFT. The service
+listens on `127.0.0.1:8123`. To use a different port, set `PORT` in both shells.
+
+~~~bash
+bash docs/recipes/ascend_prefix_910b2.sh smoke
+~~~
+
 On the experimental branch based on `3e115dfeeb16`, add
 `--enable-prefix-caching` to the synchronous `ascend_eager` command above to
 reuse complete paged `last_exited` prompt blocks across requests in the same
