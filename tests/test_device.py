@@ -36,7 +36,6 @@ def npu_model_stub(**overrides):
     [
         dict(execution_config=ExecutionConfig(async_scheduling=True)),
         dict(execution_config=ExecutionConfig(cuda_graphs=True)),
-        dict(cache_config=CacheConfig(num_blocks=32, enable_prefix_caching=True)),
         dict(scheduler_config=SchedulerConfig(enable_preemption=True)),
         dict(exit_config=ExitConfig(mode="ouro_delayed")),
     ],
@@ -44,6 +43,24 @@ def npu_model_stub(**overrides):
 def test_npu_unsupported_execution_rejected_before_allocation(options):
     with pytest.raises(ValueError, match="NPU Ouro requires synchronous"):
         StageEngine(npu_model_stub(), **options)
+
+
+@pytest.mark.parametrize(
+    "backend,scheduler",
+    [
+        ("torch", SchedulerConfig()),
+        ("ascend_eager", SchedulerConfig(wavefront_chunked_prefill=True)),
+        ("ascend_eager", SchedulerConfig(mode="mixed")),
+    ],
+)
+def test_npu_prefix_cache_scope(backend, scheduler):
+    with pytest.raises(ValueError, match="NPU prefix caching requires ascend_eager"):
+        StageEngine(
+            npu_model_stub(),
+            attention_backend=backend,
+            cache_config=CacheConfig(num_blocks=32, enable_prefix_caching=True),
+            scheduler_config=scheduler,
+        )
 
 
 def test_npu_does_not_use_cpu_default_memory_budget():

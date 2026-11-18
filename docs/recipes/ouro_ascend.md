@@ -67,8 +67,40 @@ They do not establish model quality or performance; use the
 [accuracy guide](../accuracy.md) and [serving benchmark guide](../serving.md)
 for those evaluations.
 
-Async scheduling, graphs, speculation, PD, preemption, prefix caching and
-adaptive exit are currently unsupported on this path.
+Async scheduling, graphs, speculation, PD, preemption and adaptive exit are
+currently unsupported on this path.
+
+### Local prefix-cache experiment
+
+On the experimental branch based on `3e115dfeeb16`, add
+`--enable-prefix-caching` to the synchronous `ascend_eager` command above to
+reuse complete paged `last_exited` prompt blocks across requests in the same
+engine. Each hit references one block per recurrent depth. At least the last
+prompt token runs again to produce the hidden state for the first output.
+Use ordinary prefill for this experiment.
+
+Run the benchmark with the assigned NPU visible and `MODEL` set to the prepared
+local checkpoint directory.
+
+~~~bash
+python -m benchmarks.ascend_prefix_cache --model "$MODEL"
+~~~
+
+The single-client benchmark loads the weights once. Each sample starts a fresh
+engine and runs a primer followed by the same target prompt. The default target
+has 128 shared synthetic token IDs and an 8-token suffix. It generates 16
+greedy tokens at four loops. The `off`, `miss` and `hit` arms use cache-off,
+an unrelated first page and a shared prefix, respectively. A separate uncached
+run splits the target at the expected hit boundary to help diagnose BF16
+differences between full and continuation prefill.
+
+The final `PREFIX` line reports the observed hit length and prefill start,
+the first differing output position (1-based, `null` for an exact match),
+and engine TTFT from request submission through the first visible token. The
+p50/p95 figures exclude priming and one warmup per arm. Override `--repeats`
+for more samples. `DIFF` identifies a token mismatch. `HIT_MISMATCH` reports
+the arm and observed counters if scheduling disagrees with the expected hit.
+Both conditions produce a nonzero exit code.
 
 ## 5. Attention batching and device-side KV writes
 
@@ -204,6 +236,6 @@ not qualify this change.
   long conversations, C16+ concurrency and models other than Ouro-1.4B are
   untested.
 - Three timed repetitions per arm on a single card; only 32-token outputs.
-- Only the full-prefill synchronous path is qualified. Async scheduling,
-  graphs, speculation, PD, preemption, prefix caching and adaptive exit
-  remain unsupported here.
+- These historical measurements cover synchronous full prefill with prefix
+  caching disabled. The local prefix-cache experiment needs its own NPU
+  correctness and latency results.
