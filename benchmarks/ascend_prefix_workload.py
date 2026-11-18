@@ -36,6 +36,11 @@ class Case:
         if self.hits is not None and not 0 <= self.hits <= self.concurrency:
             raise ValueError("hits must be between zero and concurrency")
 
+    @property
+    def reusable_tokens(self):
+        limit = min(self.prefix, self.prefix + self.suffix - 1)
+        return limit // BLOCK_SIZE * BLOCK_SIZE
+
 
 def _markers(rng, vocab, count, reserved):
     if count + len(reserved) > vocab:
@@ -134,14 +139,11 @@ def _target_burst(engine, targets, params, expected):
     }
 
 
-@torch.inference_mode()
-def run_trial(model, backend, case, arm, output_tokens, seed, *, target_context=None):
-    """Prime a fresh engine, optionally evict the donor, then submit one target burst."""
-    if arm not in ("off", "miss", "reuse") or output_tokens < 1:
-        raise ValueError("expected off/miss/reuse arm and positive output length")
-    donor, targets, fillers = _prompts(case, arm, output_tokens, model.config.vocab_size, seed)
-    length = len(donor)
-    capacity = length + output_tokens - 1
+def create_trial_engine(
+    model, backend, case, arm, prompt_length, output_tokens, *, chunk_size=None
+):
+    """Build the matrix engine and fixed-depth greedy parameters for timing or replay."""
+    capacity = prompt_length + output_tokens - 1
     blocks = model.config.total_ut_steps * math.ceil(capacity / BLOCK_SIZE)
     tight_pool = case.churn > 0 or case.tight_pool
     pool = blocks * (case.concurrency if tight_pool else case.concurrency + 1)
@@ -156,41 +158,57 @@ def run_trial(model, backend, case, arm, output_tokens, seed, *, target_context=
         scheduler_config=SchedulerConfig(
             max_num_seqs=case.concurrency,
             max_num_batched_tokens=case.concurrency * capacity,
-            prefill_chunk_size=capacity,
+            prefill_chunk_size=capacity if chunk_size is None else chunk_size,
             admission_scan_limit=max(case.concurrency, 64),
         ),
     )
     params = SamplingParams(
         max_tokens=output_tokens, temperature=0, min_loops=4, max_loops=4, ignore_eos=True
     )
-    prime_params = replace(params, max_tokens=1)
-    try:
-        generate(engine, "donor", donor, prime_params)
-        primed_hit_tokens = None
-        if tight_pool:
-            primed_hit_tokens = len(engine.cache_manager.lookup_prefix(targets[0])) * BLOCK_SIZE
-        for start in range(0, len(fillers), case.concurrency):
-            for index, prompt in enumerate(fillers[start : start + case.concurrency], start):
-                engine.add_request(f"churn-{index}", prompt, prime_params)
-            while engine.has_unfinished_requests():
-                engine.step()
+    return engine, params
 
-        matched = min(case.prefix, length - 1) // BLOCK_SIZE * BLOCK_SIZE
-        hot = case.concurrency if case.hits is None else case.hits
-        expected = [
-            matched if arm == "reuse" and i < hot and not case.churn else 0
-            for i in range(case.concurrency)
-        ]
+
+def prime_trial(engine, case, donor, targets, fillers, params):
+    """Run the donor, then the tight-pool LRU lookup and churn bursts in matrix order."""
+    prime_params = replace(params, max_tokens=1)
+    generate(engine, "donor", donor, prime_params)
+    primed_hit_tokens = None
+    if case.churn > 0 or case.tight_pool:
+        primed_hit_tokens = len(engine.cache_manager.lookup_prefix(targets[0])) * BLOCK_SIZE
+    for start in range(0, len(fillers), case.concurrency):
+        for index, prompt in enumerate(fillers[start : start + case.concurrency], start):
+            engine.add_request(f"churn-{index}", prompt, prime_params)
+        while engine.has_unfinished_requests():
+            engine.step()
+    return primed_hit_tokens
+
+
+def expected_hits(case, arm):
+    """Return the expected donor hit before churn and each target hit after churn."""
+    hot = case.concurrency if case.hits is None else case.hits
+    primed = case.reusable_tokens if arm == "reuse" and hot else 0
+    return primed, [primed if i < hot and not case.churn else 0 for i in range(case.concurrency)]
+
+
+@torch.inference_mode()
+def run_trial(model, backend, case, arm, output_tokens, seed, *, target_context=None):
+    """Prime a fresh engine, optionally evict the donor, then submit one target burst."""
+    if arm not in ("off", "miss", "reuse") or output_tokens < 1:
+        raise ValueError("expected off/miss/reuse arm and positive output length")
+    donor, targets, fillers = _prompts(case, arm, output_tokens, model.config.vocab_size, seed)
+    engine, params = create_trial_engine(model, backend, case, arm, len(donor), output_tokens)
+    try:
+        primed_hit_tokens = prime_trial(engine, case, donor, targets, fillers, params)
+        expected_primed, expected = expected_hits(case, arm)
         with target_context() if target_context is not None else nullcontext():
             result = _target_burst(engine, targets, params, expected)
         for record, prompt in zip(result["requests"], targets, strict=True):
             packed = struct.pack(f"<{len(prompt)}q", *prompt)
             record["prompt_sha256"] = hashlib.sha256(packed).hexdigest()
-        expected_primed = matched if arm == "reuse" and hot else 0
         result.update(
             churn_requests=len(fillers),
             primed_hit_tokens=primed_hit_tokens,
-            expected_primed_hit_tokens=expected_primed if tight_pool else None,
+            expected_primed_hit_tokens=expected_primed if primed_hit_tokens is not None else None,
         )
         return result
     finally:

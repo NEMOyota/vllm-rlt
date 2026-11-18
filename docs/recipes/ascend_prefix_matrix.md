@@ -74,6 +74,27 @@ python -m benchmarks.ascend_prefix_matrix --read-report results/candidate.json \
 
 ## 从异常结果定位代码
 
+CSV 中用场景名和 `status=FAIL` 定位行；原始终端中的 `场景名 FAIL` 后面附有首条分歧。用下面的命令直接离线读取原矩阵 JSON，按场景区分预热与计时轮，打印出错轮次、类别和首条证据。只读报告无需权重或 NPU。
+
+~~~bash
+python -m benchmarks.ascend_prefix_diagnose --report results/prefix-baseline.json
+~~~
+
+需要复现时，在相同环境里加上权重和一个新的输出文件。默认处理原报告标记的场景并各跑两轮，也可以重复指定 `--case`。以下示例保留原来四个目标的顺序、seed、16 个输出及四个循环深度，比较关闭缓存、开启未命中、命中复用和无缓存分块四条路径。
+
+~~~bash
+python -m benchmarks.ascend_prefix_diagnose --report results/prefix-baseline.json \
+  --case c4_h4 --model "$MODEL" --out results/diag-c4-h4.json
+~~~
+
+`ARCHIVE` 的 `target` 从 0 编号，`first_diff_1based` 从 1 编号。`DIAG` 给出重放各组输出的对比、分歧位置和两名候选 token 的分数。完整 JSON 还保存每次调度的请求、阶段、范围、循环数、分配页表、共享页内容检查和候选分差。先区分三种现象：
+
+- 命中数或起点与预期不符，检查缓存查找和调度起点；起点正确但物理页不符、私有尾页重叠或共享页摘要改变，检查分配与写入。
+- 若页检查通过，且复用与无缓存分块给出同一输出、与完整 prefill 分歧，优先比较算子形状与首次分歧时的 logits。分数接近本身不能证明 BF16 是根因。
+- 一次重放通过仅说明本轮未复现。根据原来的预热、计时轮和失败频率，重新检查原矩阵中的严格逐 token 对照，再恢复性能验收。
+
+诊断运行会读回页内容和 logits，不能用其耗时做性能结论。共享页检查覆盖 donor 释放前与目标结束后两个端点；它能发现保留下来的改写，无法单独证明 donor 计算出的 KV 数值或每次设备读取地址正确。
+
 | 观测 | 下一步验证 |
 | --- | --- |
 | 页边界、完全重复或压力场景命中长度不符 | 看首次 prefill 偏移、KV 页发布覆盖和淘汰前后的查找结果 |
