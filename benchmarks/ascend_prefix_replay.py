@@ -2,7 +2,9 @@
 
 import hashlib
 import struct
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
+from dataclasses import replace
+from unittest.mock import patch
 
 import torch
 
@@ -14,6 +16,39 @@ from benchmarks.ascend_prefix_workload import (
     prime_trial,
 )
 from vllm_rlt.request import RequestPhase
+
+
+def _prime_and_record(engine, case, donor, targets, fillers, params, donor_boundary):
+    """Record executed donor spans and restore its optional chunk limit before any fillers."""
+    spans = []
+    step = engine.step
+    with ExitStack() as donor_settings:
+        if donor_boundary is not None:
+            config = replace(engine.scheduler.config, prefill_chunk_size=donor_boundary)
+            donor_settings.enter_context(patch.object(engine.scheduler, "config", config))
+
+        def record_step():
+            outputs = step()
+            batch = engine.last_schedule
+            for item in batch.requests:
+                if (
+                    item.request.request_id == "donor"
+                    and batch.phase_for(item) == RequestPhase.PREFILL
+                ):
+                    spans.append(
+                        dict(
+                            token_start=item.token_start,
+                            token_count=item.token_count,
+                            loop_count=batch.loop_count,
+                        )
+                    )
+            if any(out.finished and out.request_id == "donor" for out in outputs):
+                donor_settings.close()
+            return outputs
+
+        with patch.object(engine, "step", record_step):
+            prime_trial(engine, case, donor, targets, fillers, params)
+    return spans
 
 
 def _target_steps(engine, targets, params, expected):
@@ -95,27 +130,32 @@ def replay_mode(
     target_context=None,
     engine_context=None,
 ):
-    """Replay off/miss/reuse, or an uncached target split at the matching full-page boundary.
+    """Replay the matrix arms, an uncached split or a cached donor split at the hit boundary.
 
     target_context(engine, targets, donor) can observe the target burst. targets is ordered
     like the requests in the matrix report. The primer is complete before this context starts.
     engine_context(engine, targets, donor) covers the donor, fillers and targets for KV checks.
     Both contexts unwind before the engine closes, including on failure.
     """
-    if mode not in ("off", "miss", "reuse", "split") or output_tokens < 1:
-        raise ValueError("expected off, miss, reuse or split mode and positive output_tokens")
-    arm = "off" if mode == "split" else mode
+    if mode not in ("off", "miss", "reuse", "split", "aligned") or output_tokens < 1:
+        raise ValueError(
+            "expected off, miss, reuse, split or aligned mode and positive output_tokens"
+        )
+    arm = {"split": "off", "aligned": "reuse"}.get(mode, mode)
     donor, targets, fillers = _prompts(case, arm, output_tokens, model.config.vocab_size, seed)
     chunk_size = case.reusable_tokens if mode == "split" else None
-    if chunk_size == 0:
-        raise ValueError("split replay requires at least one full reusable prefix page")
+    donor_boundary = case.reusable_tokens if mode == "aligned" else None
+    if chunk_size == 0 or donor_boundary == 0:
+        raise ValueError("boundary-aligned replay requires at least one full reusable prefix page")
     engine, params = create_trial_engine(
         model, backend, case, arm, len(donor), output_tokens, chunk_size=chunk_size
     )
     try:
         lifetime = engine_context(engine, targets, donor) if engine_context else nullcontext()
         with lifetime:
-            prime_trial(engine, case, donor, targets, fillers, params)
+            donor_spans = _prime_and_record(
+                engine, case, donor, targets, fillers, params, donor_boundary
+            )
             _, expected = expected_hits(case, arm)
             context = target_context(engine, targets, donor) if target_context else nullcontext()
             with context:
@@ -125,6 +165,7 @@ def replay_mode(
             result,
             case=case.name,
             mode=mode,
+            donor_prefill_spans=donor_spans,
             prefill_chunk_size=engine.scheduler.config.prefill_chunk_size,
             max_num_batched_tokens=engine.scheduler.config.max_num_batched_tokens,
             num_blocks=engine.cache_manager.num_blocks,

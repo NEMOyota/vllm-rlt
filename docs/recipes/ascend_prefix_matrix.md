@@ -95,6 +95,15 @@ python -m benchmarks.ascend_prefix_diagnose --report results/prefix-baseline.jso
 
 诊断运行会读回页内容和 logits，不能用其耗时做性能结论。共享页检查覆盖 donor 释放前与目标结束后两个端点；它能发现保留下来的改写，无法单独证明 donor 计算出的 KV 数值或每次设备读取地址正确。
 
+当单请求的 `off` 和 `split` 输出相同、`reuse` 分歧时，可直接使用上一步保存的诊断 JSON。下面的实验增加 `aligned` 对照。它让提供前缀的请求（donor）先算 384 个 token，再算剩余 128 个。`reuse` 和 `aligned` 的目标请求都命中 384 个 token，都只计算 128 个后缀 token。
+
+~~~bash
+python -m benchmarks.ascend_prefix_boundary --diag results/prefix-diag-01.json \
+  --model "$MODEL" --case total512_p384 --out results/boundary-384.json
+~~~
+
+先看末行 `BOUNDARY` 的 `comparable`。为真表示旧配置的输出、输入摘要、命中数和起点与至少一轮历史重放对应，且本次四组都执行了预期的前缀和后缀区间。`kv` 比较请求释放前同一逻辑前缀的 BF16 字节，按循环深度、模型层和 K/V 分别计算摘要。`aligned_donor__split_target.equal` 为真且 `output_first_diff.split__aligned` 为空，表示分块生成的 donor 前缀与目标自己分块计算的前缀逐位相同，后续生成的 token 也相同。如果前缀逐位相同但输出仍有分歧，下一步检查目标读取的逻辑位置、后缀计算和首次 decode。同样的对照也支持 `--case p1024_s8`。
+
 | 观测 | 下一步验证 |
 | --- | --- |
 | 页边界、完全重复或压力场景命中长度不符 | 看首次 prefill 偏移、KV 页发布覆盖和淘汰前后的查找结果 |
