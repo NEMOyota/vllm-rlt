@@ -159,6 +159,22 @@ python -m benchmarks.ascend_prefix_suffix_trial --model "$MODEL" \
 
 阅读 `C4_SUFFIX` 时，先确认 `comparable=true`，且 `native_off_vs_reuse` 复现已有分歧。`first_v_diff_elements_vs_off` 按请求顺序列出首层后缀 V 与该请求冷基线的逐位差异数。`off_vs_first`、`off_vs_all`、`off_vs_oracle` 分别列出各请求与冷基线的首个不同 token，空列表表示全部请求完整输出相同。若 `oracle` 的 V 差异全为零而输出仍有分歧，说明仅对齐首层后缀 V 不足以恢复这个 case。完整报告还保存每个请求的投影输入差异和逐 token 的前两名分数，可在生成历史相同的位置比较。
 
+如果调整命中后缀的 V 投影仍复现 `target-2` 第 8 个 token 的分歧，可在两边生成历史相同时检验 KV 是否足以带来这次翻转。运行时使用上一步保存的完整 JSON。
+
+~~~bash
+python -m benchmarks.ascend_prefix_history_transfer --model "$MODEL" \
+  --suffix results/c4-suffix-01.json --out results/c4-history-01.json
+~~~
+
+脚本从原生热请求读取 `target-2` 的有效 K/V，在独立的原生冷批次中只替换 `target-2` 的私有页。热路径四个请求各命中 128 个 token，接收数据的冷路径照常运行。两次 `sham` 把冷端原值写回；脚本还核对其余三个请求每次采样的前两名分数和 token。每个实验都从头运行，主机暂存的 BF16 页仅用于本次比较。
+
+| 写入时点 | 对照组和替换范围（逻辑 token 下标，左闭右开） |
+| --- | --- |
+| 已生成第 1 个 token，尚未消费它 | `prompt` 换整个提示的 KV（0–144），`prefix` 只换共享前缀（0–128），`suffix` 只换后缀（128–144） |
+| 已生成第 7 个 token，尚未消费它 | `history` 换全部有效 KV（0–150），`late_prompt` 只换提示（0–144），`generated` 只换前 6 个已消费的生成 token（144–150） |
+
+先确认 `C4_HISTORY` 中 `comparable=true`、两组 `sham` 与冷基线相同，并且原生分歧复现。`focus_8_on_native_history` 给出相同前 7 个 token 后各组生成的第 8 个 token；此前已分歧的组显示 `null`，实际分歧见 `first_diff_vs_off`。若 `prompt` 得到热端 token，说明仅带入 prefill 结束时该请求的 KV，就足以在冷 decode 中复现这个翻转。若只有在更晚时点换入 KV 才复现，结合 `late_prompt` 和 `generated` 判断各片段是否足够。不同片段可能共同影响接近并列的分数。输出同时记录冷热两个候选的得分差，限于已有相同历史且这两个候选均在前两名的位置。
+
 | 观测 | 下一步验证 |
 | --- | --- |
 | 页边界、完全重复或压力场景命中长度不符 | 看首次 prefill 偏移、KV 页发布覆盖和淘汰前后的查找结果 |
