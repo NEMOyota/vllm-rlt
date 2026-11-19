@@ -130,6 +130,15 @@ python -m benchmarks.ascend_prefix_c4_oracle --model "$MODEL" \
 
 在 `C4_ORACLE` 中先看 `comparable`、`controls` 和实际命中数。`cold_vs_donor` 比较每个冷目标与原生 donor 的逻辑前缀，`cold_vs_focus` 比较各冷目标与被复制的目标。`off_vs_cold_pages` 为空表示复制冷前缀后，四个请求的全段输出均与冷基线相同。如果各冷目标的前缀逐位不同，只有与复制前缀一致的目标可用于判断“给定自己的冷前缀再续算”这一问题。第 7、8 个 token 的分数只在该请求此前的生成历史与冷组相同时展示。这个实验需要先算出冷前缀，只用于定位正确性。
 
+当换入目标自己的冷前缀仍出现分歧，可用上一步的完整报告检查两个问题。首先在冷批次中完整重放一次，然后仅改变 `target-2` 的首个后缀 token，再试四个槽都放入该目标的相同完整 prompt。脚本在 prefill 刚结束、后续生成 token 尚未送回时，比较四个循环深度和各层的逻辑前缀 K/V。基线重复运行便于识别同输入漂移。前缀指纹比较中的 `null` 表示本次比较逐位相同。
+
+~~~bash
+python -m benchmarks.ascend_prefix_c4_consumer --model "$MODEL" \
+  --oracle results/c4-pages-01.json --out results/c4-consumer-01.json
+~~~
+
+在 `ascend_eager` 上，脚本还保留冷前向的原始 attention 输出，从同一次调用取出四个目标最后 16 行旋转后的 Q，让原生续算路径用当时的页表只读访问相同的 K/V。将结果与冷输出的相应 16 行对比；引擎继续使用原始输出。这个对照固定了输入和冷批次私有页，能够衡量计算形状与布局引入的差异。它覆盖当前样本的冷前向，真实共享页寻址和端到端 token 因果归因仍需各自的验证。终端输出 `C4_SLOT` 和 `C4_ATTN`；CPU torch 基线只运行槽位对照。
+
 | 观测 | 下一步验证 |
 | --- | --- |
 | 页边界、完全重复或压力场景命中长度不符 | 看首次 prefill 偏移、KV 页发布覆盖和淘汰前后的查找结果 |

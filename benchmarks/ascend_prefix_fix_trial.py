@@ -164,12 +164,15 @@ def fix_trial(model, backend, case, contract, priors, rows):
 
 
 def load_replay_inputs(parser, args, names):
-    if args.out.exists() or not args.model.is_dir():
-        parser.error("supply a new output path and a local checkpoint")
     diag = json.loads(args.diag.read_text())
     if diag.get("state") != "complete" or any(not diag.get("cases", {}).get(n) for n in names):
         parser.error("expected a completed diagnosis with replay records for all selected cases")
-    contract = diag["contract"]
+    return diag, load_replay_model(parser, args, diag["contract"])
+
+
+def load_replay_model(parser, args, contract):
+    if args.out.exists() or not args.model.is_dir():
+        parser.error("supply a new output path and a local checkpoint")
     device_type = contract["device"]
     if device_type not in ("cpu", "npu") or (
         contract["dtype"],
@@ -183,8 +186,7 @@ def load_replay_inputs(parser, args, names):
     device = resolve_device("npu:0" if device_type == "npu" else "cpu")
     if device.type == "npu":
         torch.npu.set_device(0)
-    model = OuroForCausalLM.from_pretrained(args.model, device=device, dtype=torch.bfloat16)
-    return diag, model
+    return OuroForCausalLM.from_pretrained(args.model, device=device, dtype=torch.bfloat16)
 
 
 def main():
