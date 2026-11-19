@@ -148,6 +148,17 @@ python -m benchmarks.ascend_prefix_c4_writer --model "$MODEL" \
 
 每行 `C4_WRITE` 的 `comparable` 表示输入、输出、调度和前缀指纹复现了对应归档。`first_v_difference` 给出各位置最早有位差的观测点，依次为首层输入、归一化输出、V 投影输入、投影输出、写入前 V 和立即按请求逻辑页读回的 V。`null` 表示这些点上该位置与参照一致。`write_read_mismatch` 单独给出**同一位置**的写前与读回之间有多少 K/V 元素不同。`address_issue` 核对预先计算的写入地址。昇腾运行还会核对实际提交给 Scatter ND 的页号、层号和页内偏移，报告与请求自身页表的首个冲突。完整 JSON 保留每阶段的差异数、最大绝对差，以及投影输入行完全一致时对代表性元素的 CPU FP64 点积。实验运行的读回开销只适合正确性定位。
 
+若 `C4_WRITE` 的首个差异在 `v_proj` 且各槽位写回一致，可以用原版冷、热输出检验调整命中后缀的 V 投影能否恢复四个请求的全部生成 token。这个实验复用已有的 `C4_ORACLE` 报告。
+
+~~~bash
+python -m benchmarks.ascend_prefix_suffix_trial --model "$MODEL" \
+  --oracle results/c4-pages-01.json --out results/c4-suffix-01.json
+~~~
+
+`c4_h4` 的冷批次有 4 个请求，每个 144 行。原生热批次中每个请求命中 128 个 token，只计算 16 行后缀。`first` 和 `all` 把这 16 行放回每个请求在冷批次中的行位置，其余行补零，再用原权重计算 V，只把实际后缀的结果交给 attention。`first` 仅调整第 0 轮第 0 层，`all` 调整目标 prefill 的所有层和循环。`oracle` 则在第 0 轮第 0 层直接使用每个请求自己的冷后缀 V，检验在此处逐位复原是否足够。三个对照都保留真实 donor 和命中，正常执行后续 decode。补行会增加投影计算量，此脚本仅测正确性。
+
+阅读 `C4_SUFFIX` 时，先确认 `comparable=true`，且 `native_off_vs_reuse` 复现已有分歧。`first_v_diff_elements_vs_off` 按请求顺序列出首层后缀 V 与该请求冷基线的逐位差异数。`off_vs_first`、`off_vs_all`、`off_vs_oracle` 分别列出各请求与冷基线的首个不同 token，空列表表示全部请求完整输出相同。若 `oracle` 的 V 差异全为零而输出仍有分歧，说明仅对齐首层后缀 V 不足以恢复这个 case。完整报告还保存每个请求的投影输入差异和逐 token 的前两名分数，可在生成历史相同的位置比较。
+
 | 观测 | 下一步验证 |
 | --- | --- |
 | 页边界、完全重复或压力场景命中长度不符 | 看首次 prefill 偏移、KV 页发布覆盖和淘汰前后的查找结果 |
