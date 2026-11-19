@@ -121,6 +121,15 @@ python -m benchmarks.ascend_prefix_fix_trial --diag results/prefix-diag-01.json 
 
 每例输出一行 `FIX_TRIAL`。先确认 `comparable=true`，再看 `preserves_baseline_and_parity`。为真表示候选两组在这一次重放中都保留了原始关闭缓存的完整输出。`candidate_off_vs_reuse` 为空而 `native_off_vs_candidate_off` 非空表示候选的冷、热路径一致，但改变了原始基线。单请求场景的 `layer0_different_elements` 分别给出完整计算和单独计算前缀时，首层原始 K/V 投影有多少个 BF16 元素出现位差。`head_gap_reuse_id_minus_off_id` 是原模型首次分歧处“复用组选中 ID 的分数减去关闭缓存组选中 ID 的分数”，正值偏向复用组 ID。JSON 还保留各请求的第一处分歧、投影调用计数、实际候选分数及隐藏向量摘要。候选仍有分歧也会正常写出报告。耗时包含诊断读回和额外投影调用，性能验收使用独立的未插桩矩阵。
 
+若 C4 四个目标真实命中，而候选改动改变了原始冷请求输出，可用原版算子做共享页内容对照。在 `c4_h4` 的冷批次中保存第 3 个请求（`target-2`）头 128 个 token 的全层、全循环深度 K/V。在另一个实验引擎里将这些字节复制到 donor 即将交给目标复用的页，四个目标随后按原来的页表、批次和位置续算。自拷贝对照执行相同的设备和主机传输，写回 donor 自己的原值。原始张量只保留在进程内，报告记录摘要、调度和 token。
+
+~~~bash
+python -m benchmarks.ascend_prefix_c4_oracle --model "$MODEL" \
+  --diag results/prefix-diag-01.json --out results/c4-pages-01.json
+~~~
+
+在 `C4_ORACLE` 中先看 `comparable`、`controls` 和实际命中数。`cold_vs_donor` 比较每个冷目标与原生 donor 的逻辑前缀，`cold_vs_focus` 比较各冷目标与被复制的目标。`off_vs_cold_pages` 为空表示复制冷前缀后，四个请求的全段输出均与冷基线相同。如果各冷目标的前缀逐位不同，只有与复制前缀一致的目标可用于判断“给定自己的冷前缀再续算”这一问题。第 7、8 个 token 的分数只在该请求此前的生成历史与冷组相同时展示。这个实验需要先算出冷前缀，只用于定位正确性。
+
 | 观测 | 下一步验证 |
 | --- | --- |
 | 页边界、完全重复或压力场景命中长度不符 | 看首次 prefill 偏移、KV 页发布覆盖和淘汰前后的查找结果 |

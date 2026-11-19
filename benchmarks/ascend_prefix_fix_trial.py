@@ -163,18 +163,10 @@ def fix_trial(model, backend, case, contract, priors, rows):
     )
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--diag", required=True, type=Path)
-    parser.add_argument("--model", required=True, type=Path)
-    parser.add_argument("--out", required=True, type=Path)
-    parser.add_argument("--case", choices=CASES, action="append")
-    parser.add_argument("--rows", type=int, default=64)
-    args = parser.parse_args()
-    if args.rows < 1 or args.out.exists() or not args.model.is_dir():
-        parser.error("supply a positive row count, a new output path and a local checkpoint")
+def load_replay_inputs(parser, args, names):
+    if args.out.exists() or not args.model.is_dir():
+        parser.error("supply a new output path and a local checkpoint")
     diag = json.loads(args.diag.read_text())
-    names = list(dict.fromkeys(args.case or CASES))
     if diag.get("state") != "complete" or any(not diag.get("cases", {}).get(n) for n in names):
         parser.error("expected a completed diagnosis with replay records for all selected cases")
     contract = diag["contract"]
@@ -192,6 +184,22 @@ def main():
     if device.type == "npu":
         torch.npu.set_device(0)
     model = OuroForCausalLM.from_pretrained(args.model, device=device, dtype=torch.bfloat16)
+    return diag, model
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--diag", required=True, type=Path)
+    parser.add_argument("--model", required=True, type=Path)
+    parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument("--case", choices=CASES, action="append")
+    parser.add_argument("--rows", type=int, default=64)
+    args = parser.parse_args()
+    if args.rows < 1:
+        parser.error("supply a positive row count")
+    names = list(dict.fromkeys(args.case or CASES))
+    diag, model = load_replay_inputs(parser, args, names)
+    contract = diag["contract"]
     cases = {c.name: c for c in suites()["full"]}
     report = dict(
         state="running",
