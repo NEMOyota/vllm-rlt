@@ -104,6 +104,14 @@ python -m benchmarks.ascend_prefix_boundary --diag results/prefix-diag-01.json \
 
 先看末行 `BOUNDARY` 的 `comparable`。为真表示旧配置的输出、输入摘要、命中数和起点与至少一轮历史重放对应，且本次四组都执行了预期的前缀和后缀区间。`kv` 比较请求释放前同一逻辑前缀的 BF16 字节，按循环深度、模型层和 K/V 分别计算摘要。`aligned_donor__split_target.equal` 为真且 `output_first_diff.split__aligned` 为空，表示分块生成的 donor 前缀与目标自己分块计算的前缀逐位相同，后续生成的 token 也相同。如果前缀逐位相同但输出仍有分歧，下一步检查目标读取的逻辑位置、后缀计算和首次 decode。同样的对照也支持 `--case p1024_s8`。
 
+如果完整和分块 prefill 在第 0 轮第 0 层的 K、V 就有差异，可用已保存的缓存摘要校验独立的首层计算。
+
+~~~bash
+python -m benchmarks.ascend_prefix_layer0 --model "$MODEL" --boundary results/boundary-384.json
+~~~
+
+`LAYER0` 的 `matched_boundary=true` 表示两种形状在写入前算出的 K、V 分别与原运行实际缓存的首层字节相符。再看同一前缀的 `embedding`、`norm`、`k_proj`、`v_proj`、旋转因子以及写入值的元素分歧数与最大绝对差。若归一化输出逐位相同而投影有数值差异，`sample` 给出绝对差最大的有限元素在两种形状下的值，以及相同输入和权重在 CPU 上用 FP64 点积计算的参考值。输入 token 和输出通道均从 0 编号。
+
 | 观测 | 下一步验证 |
 | --- | --- |
 | 页边界、完全重复或压力场景命中长度不符 | 看首次 prefill 偏移、KV 页发布覆盖和淘汰前后的查找结果 |
