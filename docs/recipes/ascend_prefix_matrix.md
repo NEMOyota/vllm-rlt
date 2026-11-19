@@ -189,6 +189,27 @@ python -m benchmarks.ascend_prefix_guard_trial --model "$MODEL" \
 
 `GUARD_TRIAL` 中 `recovered` 表示该轮原生热输出有分歧，策略得到的全部 token 与独立冷基线相同；`unnecessary_replay` 表示原本一致却触发了冷重算；`late` 表示之前已放行过与冷基线不同的 token；`missed` 表示策略仍有输出分歧。`target_ms` 是同次试验的整批目标请求执行时间。`guarded` 包含检测分差的开销、停止前的热端工作和实际发生的冷重算，各组均排除模型加载、创建引擎和 donor 准备。`GUARD_REVIEW` 汇总可比批次、恢复、漏判及额外重算。默认一轮，正式速度比较仍使用独立的重复性能测量。此实验适用于可重建完整批次的同步贪心回放。
 
+### 脱离引擎复现首层 Linear 的差异
+
+在原 910B2 环境中用同一 checkpoint 和已保存的报告重建首层归一化后的 BF16 输入。C1 取 `total512_p384` 原 donor 的 512 行，分别将完整矩阵及其前 384 行视图送入同一个投影。C4 取 `target-2` 的完整 144-token prompt，按原顺序复制四份得到 576 行，一次原生投影后按槽位对照。C4 的终端计数只比较每槽前 128 行，以槽位 2 为参照，完整 144 行的结果另存于 JSON。可以只传其中一份报告以运行对应的一组。
+
+~~~bash
+python -m benchmarks.ascend_prefix_linear_repro --model "$MODEL" \
+  --boundary results/boundary-384.json --writer results/c4-writer-01.json \
+  --save-fixture results/linear-inputs-01.pt --out results/linear-01.json
+~~~
+
+默认对 K 和 V 分别运行原生 `F.linear`（`linear`）、显式矩阵乘（`mm`）和固定 64 行的投影（`tile64`）。每个形状预热 2 次、测量 5 次；`p50_ms` 是含设备同步的单次投影中位耗时。计时排除了比较、哈希和主机读回。不同 PyTorch 接口可能调用同一设备算子。安装的 torch_npu 提供 `npu_linear` 时，可通过 `--ops linear mm tile64 npu_linear` 增加该对照。
+
+看 `LINEAR` 中的 `comparable` 和 `controls`。只有输入控制通过、同形状重复输出逐位稳定，才能归因于本次形状或槽位对照。`different_elements` 统计 BF16 存储位不同的元素数。`matches_archived_v` 核对该方法的 V 前缀与原引擎在第 0 轮第 0 层留下的真实 KV 字节。原始 K 经过 RoPE 后才写入 KV，因此这项只比较 V。`matches_native_full` 核对当前方法的完整投影是否保持原生长矩阵结果。输入来源、形状、步长、逐次耗时、首个不等元素及其 FP64 参考点积都保存在报告中。
+
+`--save-fixture` 可选，生成的文件包含实际激活和首层 K/V 权重，可在相同设备类型上独立重放。重放只需脚本、PyTorch 及对应的设备包。需要确认实际设备算子时，用下面的命令额外采集一次原生投影的 trace。用 Perfetto 或 MindStudio Insight 搜索 `RLT/total512_p384/k_proj/full` 等范围，比较 full、prefix 和 C4 调用对应的设备 kernel；调用次数本身不能证明采用了 split-K。
+
+~~~bash
+python -m benchmarks.ascend_prefix_linear_repro --fixture results/linear-inputs-01.pt \
+  --ops linear --trace-dir results/linear-trace-01 --out results/linear-replay-01.json
+~~~
+
 | 观测 | 下一步验证 |
 | --- | --- |
 | 页边界、完全重复或压力场景命中长度不符 | 看首次 prefill 偏移、KV 页发布覆盖和淘汰前后的查找结果 |
