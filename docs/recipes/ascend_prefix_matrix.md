@@ -175,6 +175,20 @@ python -m benchmarks.ascend_prefix_history_transfer --model "$MODEL" \
 
 先确认 `C4_HISTORY` 中 `comparable=true`、两组 `sham` 与冷基线相同，并且原生分歧复现。`focus_8_on_native_history` 给出相同前 7 个 token 后各组生成的第 8 个 token；此前已分歧的组显示 `null`，实际分歧见 `first_diff_vs_off`。若 `prompt` 得到热端 token，说明仅带入 prefill 结束时该请求的 KV，就足以在冷 decode 中复现这个翻转。若只有在更晚时点换入 KV 才复现，结合 `late_prompt` 和 `generated` 判断各片段是否足够。不同片段可能共同影响接近并列的分数。输出同时记录冷热两个候选的得分差，限于已有相同历史且这两个候选均在前两名的位置。
 
+### 检验接近并列时整批冷重算的代价
+
+对于 `c4_h4`，在第 1 个 token 后移入完整热 prompt KV 已足以把第 8 个 token 从 30 翻成 93。以下实验观察真实命中请求的热端 top‑1 与 top‑2 logits 分差。分差小于或等于阈值时，脚本暂扣整个采样步骤的输出，在独立引擎中按原 prompt、原批次和相同槽位关闭缓存重算。只有先前已放行的每个 token 都与冷输出对应，才能接用冷端结果。脚本保留逐 token 对照，专门标记触发过晚和没有触发的分歧。
+
+~~~bash
+python -m benchmarks.ascend_prefix_guard_trial --model "$MODEL" \
+  --report results/prefix-baseline.json --diag results/prefix-diag-01.json \
+  --out results/prefix-guard-01.json
+~~~
+
+默认实测阈值 `0.0625` 取自已知 C4 翻转。脚本先用已有诊断重放审计 0、0.0625、0.125、0.25 四个阈值；单独传 `--diag` 即可只读报告。实测默认包含三个已知失败场景、`p512_s8`、`c4_h1`、`c4_h0`，以及矩阵中其他标为失败的场景。`--all` 实测整份矩阵，`--threshold` 指定实测阈值，`--repeats` 可增加轮次并轮换三组顺序。
+
+`GUARD_TRIAL` 中 `recovered` 表示该轮原生热输出有分歧，策略得到的全部 token 与独立冷基线相同；`unnecessary_replay` 表示原本一致却触发了冷重算；`late` 表示之前已放行过与冷基线不同的 token；`missed` 表示策略仍有输出分歧。`target_ms` 是同次试验的整批目标请求执行时间。`guarded` 包含检测分差的开销、停止前的热端工作和实际发生的冷重算，各组均排除模型加载、创建引擎和 donor 准备。`GUARD_REVIEW` 汇总可比批次、恢复、漏判及额外重算。默认一轮，正式速度比较仍使用独立的重复性能测量。此实验适用于可重建完整批次的同步贪心回放。
+
 | 观测 | 下一步验证 |
 | --- | --- |
 | 页边界、完全重复或压力场景命中长度不符 | 看首次 prefill 偏移、KV 页发布覆盖和淘汰前后的查找结果 |
