@@ -16,7 +16,7 @@ from vllm_rlt.models import OuroForCausalLM
 
 
 @torch.inference_mode()
-def _prefix_stages(model, prompt, prefix):
+def _prefix_stages(model, prompt, prefix, *, names=None):
     # Mirror OuroForCausalLM.prelude and the first layer up to _write_prepared.
     # The archived cache fingerprints below verify both final tensors independently.
     device = model.model.embed_tokens.weight.device
@@ -40,7 +40,11 @@ def _prefix_stages(model, prompt, prefix):
         k_write=k,
         v_write=raw_v.view(shape),
     )
-    return {name: value[:prefix].detach().cpu().contiguous() for name, value in stages.items()}
+    return {
+        name: value[:prefix].detach().cpu().contiguous()
+        for name, value in stages.items()
+        if names is None or name in names
+    }
 
 
 def _compare(left, right):

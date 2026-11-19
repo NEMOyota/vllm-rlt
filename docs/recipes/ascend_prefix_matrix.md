@@ -112,6 +112,15 @@ python -m benchmarks.ascend_prefix_layer0 --model "$MODEL" --boundary results/bo
 
 `LAYER0` 的 `matched_boundary=true` 表示两种形状在写入前算出的 K、V 分别与原运行实际缓存的首层字节相符。再看同一前缀的 `embedding`、`norm`、`k_proj`、`v_proj`、旋转因子以及写入值的元素分歧数与最大绝对差。若归一化输出逐位相同而投影有数值差异，`sample` 给出绝对差最大的有限元素在两种形状下的值，以及相同输入和权重在 CPU 上用 FP64 点积计算的参考值。输入 token 和输出通道均从 0 编号。
 
+可以对三个已定位的失败场景做一次端到端干预。实验临时让各层的 K、V 投影每次接收固定行数，尾块补零并裁掉补齐行。默认 64 行是实验参数。原始和候选模型各自运行 `off` 与 `reuse`，保留实际命中、同批请求和调度区间。若历史重放的首次分歧一致，还会捕获原模型在该步进入 LM head 的真实隐藏行，用同一份权重在 CPU 上以 FP64 重算两个候选的分数。
+
+~~~bash
+python -m benchmarks.ascend_prefix_fix_trial --diag results/prefix-diag-01.json \
+  --model "$MODEL" --out results/fix-trial-01.json
+~~~
+
+每例输出一行 `FIX_TRIAL`。先确认 `comparable=true`，再看 `preserves_baseline_and_parity`。为真表示候选两组在这一次重放中都保留了原始关闭缓存的完整输出。`candidate_off_vs_reuse` 为空而 `native_off_vs_candidate_off` 非空表示候选的冷、热路径一致，但改变了原始基线。单请求场景的 `layer0_different_elements` 分别给出完整计算和单独计算前缀时，首层原始 K/V 投影有多少个 BF16 元素出现位差。`head_gap_reuse_id_minus_off_id` 是原模型首次分歧处“复用组选中 ID 的分数减去关闭缓存组选中 ID 的分数”，正值偏向复用组 ID。JSON 还保留各请求的第一处分歧、投影调用计数、实际候选分数及隐藏向量摘要。候选仍有分歧也会正常写出报告。耗时包含诊断读回和额外投影调用，性能验收使用独立的未插桩矩阵。
+
 | 观测 | 下一步验证 |
 | --- | --- |
 | 页边界、完全重复或压力场景命中长度不符 | 看首次 prefill 偏移、KV 页发布覆盖和淘汰前后的查找结果 |
