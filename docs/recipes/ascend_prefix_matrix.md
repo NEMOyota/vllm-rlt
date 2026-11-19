@@ -139,6 +139,15 @@ python -m benchmarks.ascend_prefix_c4_consumer --model "$MODEL" \
 
 在 `ascend_eager` 上，脚本还保留冷前向的原始 attention 输出，从同一次调用取出四个目标最后 16 行旋转后的 Q，让原生续算路径用当时的页表只读访问相同的 K/V。将结果与冷输出的相应 16 行对比；引擎继续使用原始输出。这个对照固定了输入和冷批次私有页，能够衡量计算形状与布局引入的差异。它覆盖当前样本的冷前向，真实共享页寻址和端到端 token 因果归因仍需各自的验证。终端输出 `C4_SLOT` 和 `C4_ATTN`；CPU torch 基线只运行槽位对照。
 
+若 `C4_ATTN` 对相同输入的所有输出一致，而四条相同 prompt 的前缀仍因批次位置产生位差，可以直接查看第一次写入。以下命令重放 `clones` 和原始 `base` 两个冷批次，检查第 0 轮第 0 层。每个位置只比较前 128 个 token，以第三个请求 `target-2` 为参照。
+
+~~~bash
+python -m benchmarks.ascend_prefix_c4_writer --model "$MODEL" \
+  --consumer results/c4-consumer-01.json --out results/c4-writer-01.json
+~~~
+
+每行 `C4_WRITE` 的 `comparable` 表示输入、输出、调度和前缀指纹复现了对应归档。`first_v_difference` 给出各位置最早有位差的观测点，依次为首层输入、归一化输出、V 投影输入、投影输出、写入前 V 和立即按请求逻辑页读回的 V。`null` 表示这些点上该位置与参照一致。`write_read_mismatch` 单独给出**同一位置**的写前与读回之间有多少 K/V 元素不同。`address_issue` 核对预先计算的写入地址。昇腾运行还会核对实际提交给 Scatter ND 的页号、层号和页内偏移，报告与请求自身页表的首个冲突。完整 JSON 保留每阶段的差异数、最大绝对差，以及投影输入行完全一致时对代表性元素的 CPU FP64 点积。实验运行的读回开销只适合正确性定位。
+
 | 观测 | 下一步验证 |
 | --- | --- |
 | 页边界、完全重复或压力场景命中长度不符 | 看首次 prefill 偏移、KV 页发布覆盖和淘汰前后的查找结果 |

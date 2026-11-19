@@ -18,7 +18,9 @@ def _digest(tokens):
 
 
 @torch.inference_mode()
-def cold_slot_run(model, backend, case, contract, variant, *, observe_attention=False):
+def cold_slot_run(
+    model, backend, case, contract, variant, *, observe_attention=False, target_context=None
+):
     """Keep cold batch order/shape and donor fixed; edit one future token or clone a full target."""
     if variant not in ("base", "repeat", "future", "clones"):
         raise ValueError(f"unknown C4 slot variant: {variant}")
@@ -84,6 +86,8 @@ def cold_slot_run(model, backend, case, contract, variant, *, observe_attention=
         with ExitStack() as context:
             context.enter_context(probe)
             context.enter_context(patch.object(engine, "step", observe_step))
+            if target_context is not None:
+                context.enter_context(target_context(engine, targets, donor))
             if observe_attention:
                 from benchmarks.ascend_prefix_attention_replay import FrozenAttention
 
