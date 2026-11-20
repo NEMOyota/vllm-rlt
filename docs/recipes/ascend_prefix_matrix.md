@@ -258,3 +258,17 @@ python -m benchmarks.ascend_prefix_trace --model "$MODEL" --case p128_s8 \
 - RLT 自身的前缀复用测试包含完整页复用、继续生成、引用计数和淘汰，本矩阵沿用逐 token 的基线对照。[RLT 前缀回归](../../tests/test_prefix_growth.py) · [原始单卡测试脚本](../../benchmarks/ascend_prefix_cache.py)
 - vLLM Ascend 的双卡回归用相同长前缀及不同问题比较开关缓存后的输出，系统测试比较不同前缀共享比例的 TTFT。这里借鉴请求构造和对照方式，910B4 单卡 Ouro 的结果独立测量。[共享前缀正确性测试](https://github.com/vllm-project/vllm-ascend/blob/80a705e62778bee2d49ffa72becf557961f7c181/tests/e2e/pull_request/two_card/test_prefix_caching.py#L60-L93) · [共享比例性能配置](https://github.com/vllm-project/vllm-ascend/blob/80a705e62778bee2d49ffa72becf557961f7c181/tests/SIT/cases/models/configs/Qwen/Prefix-Cache-Qwen3-32B-Int8.yaml#L31-L70)
 - 本矩阵使用确定性合成 token ID、单卡引擎和批量到达请求。HTTP 层、自然语料、持续在线到达及多卡部署各有不同的测量口径。
+
+### 910B4 上的 MatMulV3 对照
+
+在仓库根目录激活平时运行推理的 CANN 和 Python 环境，设置 `MODEL` 指向本地 Ouro-1.4B 权重。脚本使用本机 C++17 编译器和 torch_npu 头文件编译一个仅用于测试的调用入口，显式执行随 CANN 安装的 `MatMulV3`。默认读取 `results/linear-inputs-20261119T092602.pt`，也可以用 `FIXTURE` 指定同格式文件。
+
+~~~bash
+bash docs/recipes/ascend_matmul_v3.sh full
+~~~
+
+`probe` 单测复制行的 384、512、576 三种形状。`failures` 增加原来的三个失败场景。`full` 在单算子测试后，对原生投影和 V3 K/V 投影分别跑 29 个场景，每个场景都有 off、miss、reuse 三组。数值分歧会保留到最终报告，算子调用失败或无法核实实机类型时脚本会报错。需要查阅 CANN 9.0.0 固定版本的算子源码时，可单独运行 `bash docs/recipes/ascend_matmul_v3.sh source`。
+
+每次运行创建新的 `results/matmul-v3-*` 目录。`comparison.json` 的 `probe_invariant` 表示复制行在所有通道和三种 M 之间是否逐位一致。`probe_ch18_matches_fp64` 单独记录第 18 列与 FP64 参考舍入值的一致性。`v3_parity_failed` 列出 V3 缓存矩阵失败的场景，`native_cold_changed` 列出换用 V3 后关缓存输出改变的场景。`cases` 包含第一个分歧 token 及各组 TTFT p50、p95 的变化（V3 减原生，单位毫秒）。正确性通过的场景可用于评估性能。两个矩阵各自保留 JSON 和 CSV。
+
+矩阵计时使用普通 eager 执行。脚本在计时之外用 msprof 对单算子取证，并按矩阵实际出现的 K/V 形状单独重放，核对设备侧 OP Type。`REPEATS`、`WARMUPS` 和 `OUTPUT_TOKENS` 默认分别是 5、1 和 16。
