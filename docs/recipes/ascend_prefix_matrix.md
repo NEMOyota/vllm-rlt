@@ -210,6 +210,14 @@ python -m benchmarks.ascend_prefix_linear_repro --fixture results/linear-inputs-
   --ops linear --trace-dir results/linear-trace-01 --out results/linear-replay-01.json
 ~~~
 
+用保存的 C4 输入复查第 2 行在第 18 个 V 输出通道的舍入差异时，可以按 M 分别采集。下面的命令使用 MindStudio 8.2.RC1《性能调优工具用户指南》第 6.1 节的 `msprof`，为 M=384、512 各运行一次无采集对照和一次 L1 采集。每个进程在设备上只执行一次 V 矩阵乘。
+
+~~~bash
+bash docs/recipes/ascend_bf16_msprof.sh results/linear-inputs-01.pt
+~~~
+
+终端显示新的结果目录和每份 `OP_SUMMARY` 的路径。每个 M 的 `baseline.json` 和 `profiled.json` 包含 FP64 点积参考、BF16 舍入值、指定行输出和连续相等值对应的行号范围。先检查同一 M 下两份 JSON 一致，再按指南第 12.10 节对照两份 `op_summary_*.csv` 里的 MatMul 输入形状、类型、Block Dim 与流水指标。这些字段可用于比较执行差异，核内的累加次序还需要结合具体算子实现核实。
+
 | 观测 | 下一步验证 |
 | --- | --- |
 | 页边界、完全重复或压力场景命中长度不符 | 看首次 prefill 偏移、KV 页发布覆盖和淘汰前后的查找结果 |

@@ -1,12 +1,23 @@
 """Replay one real BF16 V projection using only PyTorch and torch_npu."""
 
 import argparse
+import json
 from itertools import groupby
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
 
-def replay(x, weight):
+def row_runs(values):
+    runs = []
+    start = 0
+    for value, group in groupby(values):
+        end = start + sum(1 for _ in group)
+        runs.append((start, end - 1, value))
+        start = end
+    return runs
+
+
+def replay(x, weight, *, rows=None):
     import torch
     import torch.nn.functional as F
 
@@ -17,6 +28,21 @@ def replay(x, weight):
     row, channel = 2, 18
 
     # Same full weight in every call. Slicing its rows would change matmul N.
+    if rows is not None:
+        # Compute the scalar reference on CPU; this mode launches one NPU matmul.
+        dot = torch.dot(x[row].cpu().double(), weight[channel].cpu().double())
+        x.copy_(x[row].clone().expand_as(x))
+        values = F.linear(x[:rows], weight).cpu()[:, channel].tolist()
+        return {
+            "rows": rows,
+            "channel": channel,
+            "row2": values[row],
+            "row290": values[290],
+            "fp64_dot": dot.item(),
+            "rounded_bf16": dot.bfloat16().item(),
+            "runs": row_runs(values),
+        }
+
     original = F.linear(x, weight).cpu()
     print(
         "ORIGINAL slot0_vs_slot2_v_diffs",
@@ -36,12 +62,6 @@ def replay(x, weight):
         # All three inputs share the base address and only differ in M.
         values = F.linear(x[:m], weight)[:, channel].cpu().tolist()
         repeat = F.linear(x[:m], weight)[:, channel].cpu().tolist()
-        runs = []
-        start = 0
-        for value, group in groupby(values):
-            end = start + sum(1 for _ in group)
-            runs.append((start, end - 1, value))
-            start = end
         changes = sum(a != b for a, b in zip(values, reference[:m]))
         print(
             "ROW_MAP",
@@ -51,7 +71,7 @@ def replay(x, weight):
             "changed_vs_576",
             changes,
             "runs",
-            runs,
+            row_runs(values),
         )
 
 
@@ -92,9 +112,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("fixture", type=Path, help="original exported linear-inputs .pt")
     parser.add_argument("--pack", type=Path, metavar="ZIP", help="create a new local handoff ZIP")
+    parser.add_argument("--rows", type=int, choices=(384, 512), help="run just one V projection")
+    parser.add_argument("--result", type=Path, help="save the single-projection result as new JSON")
     parser.add_argument("--trace-dir", type=Path, help="profiler directory for this fixture run")
     args = parser.parse_args()
+    if args.result and args.rows is None:
+        parser.error("--result requires --rows")
     if args.pack:
+        if args.rows is not None:
+            parser.error("use --rows separately from --pack")
         if args.trace_dir is None:
             parser.error("--pack requires --trace-dir")
         pack(args.fixture, args.pack, args.trace_dir)
@@ -118,7 +144,13 @@ def main():
     weight = data["weights"]["v_proj"].to("npu:0")
     x = data["cases"]["c4_h4"]["x"].to("npu:0")
     with torch.inference_mode():
-        replay(x, weight)
+        result = replay(x, weight, rows=args.rows)
+    if result is not None:
+        line = json.dumps(result, allow_nan=False)
+        print("PROJECTION", line, flush=True)
+        if args.result:
+            with args.result.open("x") as handle:
+                print(line, file=handle)
 
 
 if __name__ == "__main__":
