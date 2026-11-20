@@ -73,9 +73,9 @@ currently unsupported on this path.
 ### Local prefix-cache experiment
 
 For a 29-case workload matrix, paired cache-off comparisons, saved historical
-baselines and NPU traces, see the [910B2 prefix-cache benchmark](ascend_prefix_matrix.md).
+baselines and NPU traces, see the [910B4 prefix-cache benchmark](ascend_prefix_matrix.md).
 
-For the 910B2 experiment, export the assigned `ASCEND_RT_VISIBLE_DEVICES` and
+For the 910B4 experiment, export the assigned `ASCEND_RT_VISIBLE_DEVICES` and
 set `MODEL` to the absolute path of the local Ouro-1.4B checkpoint and tokenizer.
 Run the following commands from the repository root in your existing CANN 9.0.0,
 Torch 2.9.0 and Torch-NPU 2.9.0 environment. Run the tests on an idle card first.

@@ -1,4 +1,4 @@
-# 910B2 Prefix Cache 性能测试
+# 910B4 Prefix Cache 性能测试
 
 本实验覆盖单卡 Ouro-1.4B、BF16、同步 `ascend_eager`、固定四轮 greedy 的引擎路径。使用已经跑通基线的容器、分配的 `ASCEND_RT_VISIBLE_DEVICES` 和本地权重目录 `$MODEL`。停掉占用同一张卡的 HTTP 服务，在仓库根目录运行。
 
@@ -191,7 +191,7 @@ python -m benchmarks.ascend_prefix_guard_trial --model "$MODEL" \
 
 ### 脱离引擎复现首层 Linear 的差异
 
-在原 910B2 环境中用同一 checkpoint 和已保存的报告重建首层归一化后的 BF16 输入。C1 取 `total512_p384` 原 donor 的 512 行，分别将完整矩阵及其前 384 行视图送入同一个投影。C4 取 `target-2` 的完整 144-token prompt，按原顺序复制四份得到 576 行，一次原生投影后按槽位对照。C4 的终端计数只比较每槽前 128 行，以槽位 2 为参照，完整 144 行的结果另存于 JSON。可以只传其中一份报告以运行对应的一组。
+在原 910B4 环境中用同一 checkpoint 和已保存的报告重建首层归一化后的 BF16 输入。C1 取 `total512_p384` 原 donor 的 512 行，分别将完整矩阵及其前 384 行视图送入同一个投影。C4 取 `target-2` 的完整 144-token prompt，按原顺序复制四份得到 576 行，一次原生投影后按槽位对照。C4 的终端计数只比较每槽前 128 行，以槽位 2 为参照，完整 144 行的结果另存于 JSON。可以只传其中一份报告以运行对应的一组。
 
 ~~~bash
 python -m benchmarks.ascend_prefix_linear_repro --model "$MODEL" \
@@ -236,6 +236,6 @@ python -m benchmarks.ascend_prefix_trace --model "$MODEL" --case p128_s8 \
 
 ## 来源与范围
 
-- RLT 自身的前缀复用测试包含完整页复用、继续生成、引用计数和淘汰，本矩阵沿用逐 token 的基线对照。[RLT 前缀回归](../../tests/test_prefix_growth.py) · [原始 910B2 脚本](../../benchmarks/ascend_prefix_cache.py)
-- vLLM Ascend 的双卡回归用相同长前缀及不同问题比较开关缓存后的输出，系统测试比较不同前缀共享比例的 TTFT。这里借鉴请求构造和对照方式，910B2 单卡 Ouro 的结果独立测量。[共享前缀正确性测试](https://github.com/vllm-project/vllm-ascend/blob/80a705e62778bee2d49ffa72becf557961f7c181/tests/e2e/pull_request/two_card/test_prefix_caching.py#L60-L93) · [共享比例性能配置](https://github.com/vllm-project/vllm-ascend/blob/80a705e62778bee2d49ffa72becf557961f7c181/tests/SIT/cases/models/configs/Qwen/Prefix-Cache-Qwen3-32B-Int8.yaml#L31-L70)
+- RLT 自身的前缀复用测试包含完整页复用、继续生成、引用计数和淘汰，本矩阵沿用逐 token 的基线对照。[RLT 前缀回归](../../tests/test_prefix_growth.py) · [原始单卡测试脚本](../../benchmarks/ascend_prefix_cache.py)
+- vLLM Ascend 的双卡回归用相同长前缀及不同问题比较开关缓存后的输出，系统测试比较不同前缀共享比例的 TTFT。这里借鉴请求构造和对照方式，910B4 单卡 Ouro 的结果独立测量。[共享前缀正确性测试](https://github.com/vllm-project/vllm-ascend/blob/80a705e62778bee2d49ffa72becf557961f7c181/tests/e2e/pull_request/two_card/test_prefix_caching.py#L60-L93) · [共享比例性能配置](https://github.com/vllm-project/vllm-ascend/blob/80a705e62778bee2d49ffa72becf557961f7c181/tests/SIT/cases/models/configs/Qwen/Prefix-Cache-Qwen3-32B-Int8.yaml#L31-L70)
 - 本矩阵使用确定性合成 token ID、单卡引擎和批量到达请求。HTTP 层、自然语料、持续在线到达及多卡部署各有不同的测量口径。

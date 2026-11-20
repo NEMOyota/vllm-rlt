@@ -84,7 +84,7 @@ def pack(fixture, output, trace_dir):
     details = sorted(trace_dir.rglob("kernel_details.csv"))
     instructions = (
         f"Run: python repro.py {fixture.name}\n"
-        "Environment: Ascend 910B2, Ubuntu 22.04, CANN 9.0.0, torch 2.9.0, torch_npu 2.9.0.\n"
+        "Original replay environment: Ascend 910B4, Ubuntu 22.04, CANN 9.0.0, torch 2.9.0, torch_npu 2.9.0.\n"
         "Case: BF16 F.linear without bias, K=N=2048, same input row repeated 576 times.\n"
         "Observed on the original host: channel 18 changes by one BF16 ULP. "
         "For M=512 and 576, rows 128..383 differ from rows 0..127. "
