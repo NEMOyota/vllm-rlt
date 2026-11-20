@@ -272,3 +272,19 @@ bash docs/recipes/ascend_matmul_v3.sh full
 每次运行创建新的 `results/matmul-v3-*` 目录。`comparison.json` 的 `probe_invariant` 表示复制行在所有通道和三种 M 之间是否逐位一致。`probe_ch18_matches_fp64` 单独记录第 18 列与 FP64 参考舍入值的一致性。`v3_parity_failed` 列出 V3 缓存矩阵失败的场景，`native_cold_changed` 列出换用 V3 后关缓存输出改变的场景。`cases` 包含第一个分歧 token 及各组 TTFT p50、p95 的变化（V3 减原生，单位毫秒）。正确性通过的场景可用于评估性能。两个矩阵各自保留 JSON 和 CSV。
 
 矩阵计时使用普通 eager 执行。脚本在计时之外用 msprof 对单算子取证，并按矩阵实际出现的 K/V 形状单独重放，核对设备侧 OP Type。`REPEATS`、`WARMUPS` 和 `OUTPUT_TOKENS` 默认分别是 5、1 和 16。
+
+#### 社区复现与正式分派验收
+
+默认的 `probe`、`failures` 和 `full` 使用显式桥接做 K/V 对照。脚本会在自己的进程中清除继承的 `IGNORE_INFER_ERROR`。桥接给 `bias`、`offset_w` 各传一个 `OpCommand::Input()` 缺省描述符，输出仍为 BF16。若严格运行出现 `EZ9999 ... infer_datatype`，保留该次的 `run.log`、CANN/OPP 安装版本和调用源文件，报告具体失败的 GE 路径。9.0.0 源码有单独的 shape 推导注册。共享库符号计数不能判定运行时已加载哪些 dtype 规则。
+
+只为比较绕过条件下的数值行为时，显式运行下方第一条。开关作用于 V3 子进程，原生对照使用正常环境。报告标注 `route=diagnostic` 和实际环境值。正式分派验收用后两条，在待验证的 CANN/torch_npu 环境中运行。公开入口调用普通 `F.linear`，无需编译桥接。先用单算子 profiler 确认三个 M。如果实际为 V2，脚本保存 `v3-dispatch.json` 并退出。这可直接作为请求维护者确认分派的证据。
+
+~~~bash
+MODEL="$MODEL" bash docs/recipes/ascend_matmul_v3.sh failures --diagnostic-ignore-infer
+bash docs/recipes/ascend_matmul_v3.sh probe --public
+MODEL="$MODEL" BASELINE=results/prefix-baseline.json bash docs/recipes/ascend_matmul_v3.sh full --public
+~~~
+
+`BASELINE` 使用原生环境、正常 GE 校验下保存的完整矩阵，保留相同模型、设备、种子、预热次数、重复次数和输出长度。老报告若未记录环境变量，需从当时的启动配置确认。公开路径按原生引擎计时，另做一次每臂同负载重放记录 K/V 形状，随后对出现的形状用独立单算子采集核对分派。报告列出两边的 CANN、torch 和 torch_npu 版本。跨版本 TTFT 反映整个软件栈变化。与维护者对齐所支持的硬件、数据类型及 shape 范围，并附三个历史失败用例、完整矩阵、缓存命中和 TTFT 后，再决定是否调整默认分派。
+
+若公开入口仍选 V2，可向 CANN ops-nn 提交最小复现并请维护者确认 910B4 的公开分派策略。建议分别记录 GE 单算子 dtype 推导失败和 BF16 复制行的数值差异。显式桥接只改变 Ouro K/V。更新公共分派规则也可能改变其他同形状的投影，需用真实引擎回归。在 9.0.0 的 MatMulV3 基础 tiling 代码中，`0x4` 对应的强制分组累加路径要求 FP32 输入。BF16 实验应分别报告跨行一致性和参考舍入值。

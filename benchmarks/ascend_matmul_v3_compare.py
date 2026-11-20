@@ -9,13 +9,26 @@ from benchmarks.ascend_prefix_scenarios import ARMS, suites
 FOCUS = ("p1024_s8", "total512_p384", "c4_h4")
 
 
-def compare(native, candidate, names):
+RUNTIME_KEYS = ("cann_version", "torch_version", "torch_npu_version")
+
+
+def compare(native, candidate, names, route="bridge"):
     contract = candidate["contract"].copy()
-    if contract.pop("kv_projection", None) != "MatMulV3" or contract != native["contract"]:
+    original = native["contract"].copy()
+    projection = "native-dispatch-audit" if route == "public" else "MatMulV3"
+    expected_override = "1" if route == "diagnostic" else None
+    if contract.pop("ignore_infer_error", None) != expected_override:
+        raise ValueError("unexpected GE inference override in the candidate matrix")
+    if route == "public":
+        for key in RUNTIME_KEYS:
+            contract.pop(key, None)
+            original.pop(key, None)
+    if contract.pop("kv_projection", None) != projection or contract != original:
         raise ValueError("incompatible matrix contracts or missing V3 intervention")
-    for report in (native, candidate):
-        if report["state"] != "complete" or set(report["cases"]) != set(names):
-            raise ValueError("incomplete suite or unexpected set of cases")
+    if native["state"] != "complete" or not set(names).issubset(native["cases"]):
+        raise ValueError("native baseline does not cover the requested cases")
+    if candidate["state"] != "complete" or set(candidate["cases"]) != set(names):
+        raise ValueError("incomplete candidate suite or unexpected set of cases")
 
     cases = {}
     for name in names:
@@ -71,23 +84,36 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path)
     parser.add_argument("stage", choices=("probe", "failures", "full"))
+    parser.add_argument("--route", choices=("public", "bridge", "diagnostic"), default="bridge")
     args = parser.parse_args()
 
     def read(name):
         return json.loads((args.directory / name).read_text())
 
     numerical = read("v3-probe.json")
+    if numerical["ignore_infer_error"] != ("1" if args.route == "diagnostic" else None):
+        raise ValueError("probe GE environment disagrees with requested route")
+    if numerical["impl"] != ("native" if args.route == "public" else "v3"):
+        raise ValueError("probe projection disagrees with requested route")
+    arms = ("v3",) if args.route == "public" else ("native", "v3")
     result = {
+        "route": args.route,
+        "ignore_infer_error": numerical["ignore_infer_error"],
         "probe_invariant": numerical["invariant"],
         "probe_ch18_matches_fp64": all(
             v["ch18_different_from_rounded_fp64"] == 0 for v in numerical["rows"].values()
         ),
-        "dispatch": {arm: read(f"{arm}-dispatch.json")["types"] for arm in ("native", "v3")},
+        "dispatch": {arm: read(f"{arm}-dispatch.json")["types"] for arm in arms},
     }
     if args.stage != "probe":
         result["matrix_shape_replay_dispatch"] = read("v3-matrix-dispatch.json")["types"]
         names = FOCUS if args.stage == "failures" else [c.name for c in suites()["full"]]
-        cases = compare(read("native-matrix.json"), read("v3-matrix.json"), names)
+        native, candidate = read("native-matrix.json"), read("v3-matrix.json")
+        cases = compare(native, candidate, names, args.route)
+        result["runtime_versions"] = {
+            arm: {k: report["contract"].get(k) for k in RUNTIME_KEYS}
+            for arm, report in (("baseline", native), ("candidate", candidate))
+        }
         result.update(
             cases=cases,
             v3_parity_failed=[n for n in names if cases[n]["v3_parity"] != "PASS"],

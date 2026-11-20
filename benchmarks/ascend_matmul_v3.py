@@ -57,14 +57,19 @@ def load_projection(library):
 
 @contextmanager
 def use_v3_kv(model, library):
-    project = load_projection(library)
+    """With no bridge, observe native Linear calls without replacing their implementation."""
+    project = load_projection(library) if library else None
     calls = Counter()
     shapes = set()
 
-    def forward(module, name, x):
-        result = project(x, module.weight)
+    def observe(name, module, inputs):
+        (x,) = inputs
         calls[name] += 1
         shapes.add((x.size(0), x.size(1), module.weight.size(0)))
+
+    def forward(module, name, x):
+        result = project(x, module.weight)
+        observe(name, module, (x,))
         return result
 
     with ExitStack() as patches:
@@ -73,9 +78,14 @@ def use_v3_kv(model, library):
                 module = getattr(layer.self_attn, name)
                 if module.bias is not None:
                     raise ValueError("V3 experiment requires bias-free K/V projections")
-                patches.enter_context(
-                    patch.object(module, "forward", partial(forward, module, name))
-                )
+                if project is not None:
+                    patches.enter_context(
+                        patch.object(module, "forward", partial(forward, module, name))
+                    )
+                else:
+                    patches.callback(
+                        module.register_forward_pre_hook(partial(observe, name)).remove
+                    )
         yield calls, shapes
 
 
@@ -119,8 +129,23 @@ def collect(x, weight, project):
 
 def probe(fixture, library):
     import torch_npu
+    from torch_npu.utils.collect_env import get_cann_version
 
     torch.npu.set_device(0)
+    try:
+        cann = get_cann_version() if os.environ.get("ASCEND_HOME_PATH") else None
+    except (OSError, RuntimeError):
+        cann = None
+    environment = dict(
+        device=torch.npu.get_device_name(0),
+        torch=str(torch.__version__),
+        torch_npu=torch_npu.__version__,
+        cann=cann,
+        opp_path=os.environ.get("ASCEND_OPP_PATH"),
+        impl="v3" if library else "native",
+        ignore_infer_error=os.environ.get("IGNORE_INFER_ERROR"),
+    )
+    print("PROBE_ENV", json.dumps(environment), flush=True)
     data = torch.load(fixture, map_location="cpu", weights_only=True)
     x = data["cases"]["c4_h4"]["x"]
     w = data["weights"]["v_proj"]
@@ -134,18 +159,15 @@ def probe(fixture, library):
     op = load_projection(library) if library else torch.nn.functional.linear
     with torch.inference_mode():
         result = collect(x.to("npu:0"), w.to("npu:0"), op)
-    return dict(
-        device=torch.npu.get_device_name(0),
-        torch=str(torch.__version__),
-        torch_npu=torch_npu.__version__,
-        impl="v3" if library else "native",
-        **result,
-    )
+    return dict(**environment, **result)
 
 
 def matrix_shapes(path):
     report = json.loads(path.read_text())
-    if report["state"] != "complete" or report["contract"].get("kv_projection") != "MatMulV3":
+    if report["state"] != "complete" or report["contract"].get("kv_projection") not in (
+        "MatMulV3",
+        "native-dispatch-audit",
+    ):
         raise ValueError("expected a completed V3 matrix")
     return sorted(
         {tuple(shape) for entry in report["cases"].values() for shape in entry["v3_shapes"]}
@@ -153,7 +175,9 @@ def matrix_shapes(path):
 
 
 def replay_shapes(library, shapes):
-    project = load_projection(library)
+    import torch_npu  # noqa: F401
+
+    project = load_projection(library) if library else torch.nn.functional.linear
     torch.npu.set_device(0)
     with torch.inference_mode():
         for m, k, n in shapes:
@@ -176,14 +200,28 @@ def evidence(capture, require_v3, shapes=None):
                     continue
                 inputs = row.get("input shapes", "").strip('"').replace(" ", "").split(";")
                 output = row.get("output shapes", "").strip('" ()[]').replace(" ", "")
+                dtypes = row.get("input data types", "").strip('"').upper().split(";")
                 for m, k, n in shapes:
-                    if inputs[:1] == [f"{m},{k}"] and output == f"{m},{n}":
-                        if "BF16" not in row.get("output data types", "").upper():
-                            raise ValueError(f"unexpected output dtype for {kind} at M={m}")
+                    if (
+                        inputs[:1] == [f"{m},{k}"]
+                        and len(inputs) >= 2
+                        and inputs[1] in (f"{n},{k}", f"{k},{n}")
+                        and output == f"{m},{n}"
+                    ):
+                        bf16 = {"DT_BF16", "BF16", "BFLOAT16", "DT_BFLOAT16"}
+                        if (
+                            len(dtypes) < 2
+                            or any(t.strip() not in bf16 for t in dtypes[:2])
+                            or row.get("output data types", "").strip('"').upper() not in bf16
+                        ):
+                            raise ValueError(
+                                f"expected BF16 operands and output for {kind} at M={m}"
+                            )
                         seen[m, k, n].add(kind)
-    if any(not kinds or (require_v3 and kinds != {"MatMulV3"}) for kinds in seen.values()):
-        raise RuntimeError(f"device dispatch unverified under {capture}: {seen}")
     return dict(
+        verified=all(
+            kinds and (not require_v3 or kinds == {"MatMulV3"}) for kinds in seen.values()
+        ),
         summaries=[str(p) for p in paths],
         types={f"{m}x{k}x{n}": sorted(v) for (m, k, n), v in seen.items()},
     )
@@ -210,7 +248,9 @@ def main():
         build(args.library)
         return
     if args.mode == "replay-shapes":
-        replay_shapes(args.library, matrix_shapes(args.matrix))
+        replay_shapes(
+            None if str(args.library) == "-" else args.library, matrix_shapes(args.matrix)
+        )
         return
     if args.mode == "probe":
         result = probe(args.fixture, args.library)
@@ -221,6 +261,8 @@ def main():
     with args.out.open("x") as f:
         json.dump(result, f, indent=2, allow_nan=False)
     print(args.mode.upper(), json.dumps(result, allow_nan=False), flush=True)
+    if args.mode == "verify" and not result["verified"]:
+        parser.exit(1, f"Device dispatch unverified. Observed types are saved in {args.out}\n")
 
 
 if __name__ == "__main__":

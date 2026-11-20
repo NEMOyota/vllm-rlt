@@ -3,7 +3,9 @@
 set -euo pipefail
 
 usage() {
-    echo "Usage: bash docs/recipes/ascend_matmul_v3.sh {source|probe|failures|full}"
+    echo "Usage: bash docs/recipes/ascend_matmul_v3.sh {source|probe|failures|full} [--public|--diagnostic-ignore-infer]"
+    echo "--public checks ordinary torch F.linear dispatch. Set BASELINE to the original native matrix JSON for failures/full."
+    echo "The default tests the explicit bridge with GE checks enabled."
     echo "FIXTURE defaults to results/linear-inputs-20261119T092602.pt. Set MODEL for matrix runs."
     echo "Optional: RESULTS_ROOT (default results), REPEATS=5, WARMUPS=1, OUTPUT_TOKENS=16."
 }
@@ -13,11 +15,20 @@ case "$stage" in
     source|probe|failures|full) ;;
     *) usage >&2; exit 2 ;;
 esac
-if (( $# > 1 )); then usage >&2; exit 2; fi
+route=bridge
+case ${2:-} in
+    '') ;;
+    --public) route=public ;;
+    --diagnostic-ignore-infer) route=diagnostic ;;
+    *) usage >&2; exit 2 ;;
+esac
+if (( $# > 2 )) || [[ $stage == source && $route != bridge ]]; then usage >&2; exit 2; fi
+# Control this per invocation even if a previous experiment exported it in the shell.
+unset IGNORE_INFER_ERROR
 
 root=${RESULTS_ROOT:-results}
 mkdir -p -- "$root"
-output=$(mktemp -d "$(realpath -- "$root")/matmul-v3-$stage-XXXXXXXX")
+output=$(mktemp -d "$(realpath -- "$root")/matmul-v3-$stage-$route-XXXXXXXX")
 echo "RESULTS $output"
 if [[ $stage == source ]]; then
     sha=8ac78fb1700262c7c7a97f36b58fe587b9917c8a
@@ -36,12 +47,32 @@ if [[ $stage != probe && ! -d ${MODEL:-} ]]; then
     echo "Set MODEL to the local Ouro checkpoint directory." >&2
     exit 2
 fi
+if [[ $route == public && $stage != probe ]]; then
+    baseline=$(realpath -e -- "${BASELINE:?Set BASELINE to the original native matrix JSON}")
+    cp -- "$baseline" "$output/native-matrix.json"
+fi
 command -v msprof >/dev/null || { echo "Activate CANN so msprof is in PATH." >&2; exit 2; }
 python_bin=$(python -c 'import sys; print(sys.executable)')
 module=benchmarks.ascend_matmul_v3
 library="$output/rlt_matmul_v3.so"
 exec > >(tee "$output/run.log") 2>&1
-"$python_bin" -m "$module" build "$library"
+echo "Stage=$stage route=$route"
+arms=(native v3)
+if [[ $route == public ]]; then
+    arms=(v3)
+    library=-
+else
+    "$python_bin" -m "$module" build "$library"
+fi
+run_arm() {
+    local arm_name=$1
+    shift
+    if [[ $arm_name == v3 && $route == diagnostic ]]; then
+        IGNORE_INFER_ERROR=1 "$@"
+    else
+        "$@"
+    fi
+}
 profile() {
     local capture_dir=$1
     shift
@@ -57,12 +88,15 @@ profile() {
         done
     fi
 }
-for arm in native v3; do
+for arm in "${arms[@]}"; do
     capture="$output/$arm-profile"
     op_args=()
     verify_args=()
-    if [[ $arm == v3 ]]; then op_args=(--library "$library"); verify_args=(--v3); fi
-    profile "$capture" probe "$fixture" "${op_args[@]}" --out "$output/$arm-probe.json"
+    if [[ $arm == v3 ]]; then
+        verify_args=(--v3)
+        if [[ $route != public ]]; then op_args=(--library "$library"); fi
+    fi
+    run_arm "$arm" profile "$capture" probe "$fixture" "${op_args[@]}" --out "$output/$arm-probe.json"
     [[ -s "$output/$arm-probe.json" ]] || { echo "Missing $arm numeric probe output" >&2; exit 2; }
     "$python_bin" -m "$module" verify "$capture" "${verify_args[@]}" --out "$output/$arm-dispatch.json"
 done
@@ -72,11 +106,15 @@ if [[ $stage != probe ]]; then
     if [[ $stage == failures ]]; then
         selection=(--case p1024_s8 --case total512_p384 --case c4_h4)
     fi
-    for arm in native v3; do
+    for arm in "${arms[@]}"; do
         op_args=()
-        if [[ $arm == v3 ]]; then op_args=(--kv-v3-library "$library"); fi
+        if [[ $route == public ]]; then
+            op_args=(--audit-native-kv)
+        elif [[ $arm == v3 ]]; then
+            op_args=(--kv-v3-library "$library")
+        fi
         status=0
-        "$python_bin" -m benchmarks.ascend_prefix_matrix --model "$MODEL" \
+        run_arm "$arm" "$python_bin" -m benchmarks.ascend_prefix_matrix --model "$MODEL" \
             --repeats "${REPEATS:-5}" --warmups "${WARMUPS:-1}" --output-tokens "${OUTPUT_TOKENS:-16}" \
             "${selection[@]}" "${op_args[@]}" --out "$output/$arm-matrix.json" || status=$?
         # A completed matrix returns 1 for numerical mismatches, also on the native baseline.
@@ -87,8 +125,8 @@ if [[ $stage != probe ]]; then
         fi
     done
     capture="$output/v3-matrix-shapes-profile"
-    profile "$capture" replay-shapes "$library" "$output/v3-matrix.json"
+    run_arm v3 profile "$capture" replay-shapes "$library" "$output/v3-matrix.json"
     "$python_bin" -m "$module" verify "$capture" --v3 --matrix "$output/v3-matrix.json" \
         --out "$output/v3-matrix-dispatch.json"
 fi
-"$python_bin" -m benchmarks.ascend_matmul_v3_compare "$output" "$stage"
+"$python_bin" -m benchmarks.ascend_matmul_v3_compare "$output" "$stage" --route "$route"

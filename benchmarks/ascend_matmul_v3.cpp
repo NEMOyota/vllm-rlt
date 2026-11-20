@@ -14,6 +14,8 @@ at::Tensor projection(const at::Tensor& x, const at::Tensor& weight) {
     cmd.Name("MatMulV3")
         .Input(x, "x1", ACL_FORMAT_ND)
         .Input(weight, "x2", ACL_FORMAT_ND)
+        .Input()  // optional bias, absent
+        .Input()  // optional offset_w, absent
         .Output(y, "y", ACL_FORMAT_ND)
         .Attr("transpose_x1", false)
         .Attr("transpose_x2", true)

@@ -37,17 +37,34 @@ def test_verify_checks_device_type_even_if_name_claims_v3(tmp_path):
     def write(last):
         with path.open("w", newline="") as stream:
             w = csv.writer(stream)
-            w.writerow(["Op Name", "OP Type", "Input Shapes", "Output Shapes", "Output Data Types"])
+            w.writerow(
+                [
+                    "Op Name",
+                    "OP Type",
+                    "Input Shapes",
+                    "Input Data Types",
+                    "Output Shapes",
+                    "Output Data Types",
+                ]
+            )
             for m, kind in [(384, "MatMulV3"), (512, "MatMulV3"), (576, last)]:
-                w.writerow(["MatMulV3", kind, f'"{m},2048;2048,2048"', f'"{m},2048"', "DT_BF16"])
+                w.writerow(
+                    [
+                        "MatMulV3",
+                        kind,
+                        f'"{m},2048;2048,2048"',
+                        "DT_BF16;DT_BF16",
+                        f'"{m},2048"',
+                        "DT_BF16",
+                    ]
+                )
 
     write("MatMulV2")
-    with pytest.raises(RuntimeError, match="unverified"):
-        v3.evidence(tmp_path, True)
+    wrong = v3.evidence(tmp_path, True)
+    assert not wrong["verified"] and wrong["types"]["576x2048x2048"] == ["MatMulV2"]
     write("MatMulV3")
     assert len(v3.evidence(tmp_path, True)["types"]) == 3
-    with pytest.raises(RuntimeError, match="unverified"):
-        v3.evidence(tmp_path, True, [(1, 2048, 2048)])
+    assert not v3.evidence(tmp_path, True, [(1, 2048, 2048)])["verified"]
 
 
 def test_engine_intervention_and_failed_native_case(monkeypatch):
@@ -61,7 +78,7 @@ def test_engine_intervention_and_failed_native_case(monkeypatch):
     monkeypatch.setattr(v3, "load_projection", lambda _: torch.nn.functional.linear)
     layer = model.model.layers[0].self_attn
     original = layer.k_proj.forward
-    with v3.use_v3_kv(model, None) as (calls, shapes):
+    with v3.use_v3_kv(model, "test-bridge") as (calls, shapes):
         candidate = {arm: run(arm) for arm in native}
         assert calls["k_proj"] == calls["v_proj"] > 0
         assert shapes and layer.k_proj.forward != original
@@ -82,3 +99,38 @@ def test_engine_intervention_and_failed_native_case(monkeypatch):
     changed["cases"][case.name]["trials"][0]["off"]["requests"][0]["tokens"][1] += 1
     row = compare(ref, changed, [case.name])[case.name]
     assert row["first_difference"]["off"]["token_1based"] == 2
+
+    new["contract"]["ignore_infer_error"] = "1"
+    with pytest.raises(ValueError, match="override"):
+        compare(ref, new, [case.name])
+    assert compare(ref, new, [case.name], "diagnostic")[case.name]["v3_parity"] == "PASS"
+
+
+def test_public_route_measures_native_forward_and_compares_archived_cases():
+    model = tiny_ouro_model(dtype=torch.bfloat16)
+    linear = model.model.layers[0].self_attn.k_proj
+    original = linear.forward
+    with v3.use_v3_kv(model, None) as (calls, shapes):
+        assert linear.forward == original
+        linear(torch.zeros(3, linear.in_features, dtype=torch.bfloat16))
+        assert calls["k_proj"] == 1
+        assert shapes == {(3, linear.in_features, linear.out_features)}
+    assert not linear._forward_pre_hooks
+
+    from tests.test_ascend_prefix_history import measurement
+
+    case = Case("tiny", "mix", 16, 3)
+    entry = measurement(case, 1, 10) | {"warmups": []}
+    old = dict(
+        state="complete",
+        cases={"tiny": entry, "extra": {}},
+        contract=dict(output_tokens=2, cann_version="9.0.0"),
+    )
+    new = deepcopy(old)
+    del new["cases"]["extra"]
+    new["cases"]["tiny"]["v3_calls"] = {"k_proj": 2, "v_proj": 2}
+    new["contract"].update(kv_projection="native-dispatch-audit", cann_version="candidate")
+    assert compare(old, new, ["tiny"], "public")["tiny"]["v3_vs_native_off"]["off"] == 0
+    new["contract"]["seed"] = 999
+    with pytest.raises(ValueError, match="incompatible"):
+        compare(old, new, ["tiny"], "public")

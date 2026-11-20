@@ -159,8 +159,8 @@ def measurement(args, cases, baseline):
         raise ValueError("--model must name a prepared local Ouro checkpoint directory")
     if args.repeats < 1 or args.warmups < 0 or args.output_tokens < 1:
         raise ValueError("repeats and output tokens must be positive, warmups nonnegative")
-    if args.kv_v3_library and args.device != "npu":
-        raise ValueError("--kv-v3-library requires --device npu")
+    if (args.kv_v3_library or args.audit_native_kv) and args.device != "npu":
+        raise ValueError("K/V dispatch experiments require --device npu")
     path = args.out or Path(
         datetime.now(timezone.utc).strftime("prefix-matrix-%Y%m%dT%H%M%S%fZ.json")
     )
@@ -204,6 +204,10 @@ def measurement(args, cases, baseline):
     )
     if args.kv_v3_library:
         contract["kv_projection"] = "MatMulV3"
+    if args.audit_native_kv:
+        contract["kv_projection"] = "native-dispatch-audit"
+    if "IGNORE_INFER_ERROR" in os.environ:
+        contract["ignore_infer_error"] = os.environ["IGNORE_INFER_ERROR"]
     report = dict(
         schema=1,
         state="running",
@@ -240,17 +244,22 @@ def measurement(args, cases, baseline):
             print(f"Starting {case.name}", flush=True)
             entry = {"trials": [], "warmups": []}
             report["cases"][case.name] = entry
-            if args.kv_v3_library:
+            if not args.kv_v3_library:
+                evaluate(case, model, backend, args, entry)
+            if args.kv_v3_library or args.audit_native_kv:
                 from benchmarks.ascend_matmul_v3 import use_v3_kv
 
                 with use_v3_kv(model, args.kv_v3_library) as (calls, shapes):
                     entry["v3_calls"] = calls
-                    evaluate(case, model, backend, args, entry)
+                    if args.audit_native_kv:
+                        # Observe a separate replay so production F.linear TTFT has no Python hooks.
+                        for arm in ARMS:
+                            run_trial(model, backend, case, arm, args.output_tokens, args.seed)
+                    else:
+                        evaluate(case, model, backend, args, entry)
                     entry["v3_shapes"] = sorted(shapes)
                     if not calls["k_proj"] or calls["v_proj"] != calls["k_proj"]:
                         raise RuntimeError("missing or unpaired V3 K/V projections")
-            else:
-                evaluate(case, model, backend, args, entry)
             if baseline is not None:
                 compare(entry, contract, baseline)
             save_report(path, report)
@@ -281,8 +290,14 @@ def main(argv=None):
         "--device", choices=("npu", "cpu"), default="npu", help="CPU reference for smoke testing"
     )
     parser.add_argument("--suite", choices=("quick", "full"), default="quick")
-    parser.add_argument(
+    route = parser.add_mutually_exclusive_group()
+    route.add_argument(
         "--kv-v3-library", type=Path, help="Use the experiment MatMulV3 bridge for Ouro K/V"
+    )
+    route.add_argument(
+        "--audit-native-kv",
+        action="store_true",
+        help="Measure native K/V projection shapes for device dispatch verification",
     )
     parser.add_argument(
         "--case", action="append", help="Select a named case from the full suite (repeatable)"
