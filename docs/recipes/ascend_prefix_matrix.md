@@ -218,6 +218,25 @@ bash docs/recipes/ascend_bf16_msprof.sh results/linear-inputs-01.pt
 
 终端显示新的结果目录和每份 `OP_SUMMARY` 的路径。每个 M 的 `baseline.json` 和 `profiled.json` 包含 FP64 点积参考、BF16 舍入值、指定行输出和连续相等值对应的行号范围。先检查同一 M 下两份 JSON 一致，再按指南第 12.10 节对照两份 `op_summary_*.csv` 里的 MatMul 输入形状、类型、Block Dim 与流水指标。这些字段可用于比较执行差异，核内的累加次序还需要结合具体算子实现核实。
 
+### 用 msprobe 采集 V 投影的实际张量
+
+在已安装 `msprobe.pytorch` 的 NPU 环境运行。每个进程把 C4 归档里的第 2 行复制到 576 个位置，然后用同一份完整 V 权重对前 M 行调用一次 `F.linear`。脚本按 8.2.RC1 手册配置 `task=tensor`，并只在这次前向调用期间打开采集。[PyTorch 精度数据采集手册](https://github.com/Ascend/mstt/blob/f18c498d31e838ce296960728ed97c2c8880c8b5/debug/accuracy_tools/msprobe/docs/05.data_dump_PyTorch.md)
+
+~~~bash
+OUT="results/msprobe-$(date +%Y%m%dT%H%M%S)"
+for M in 384 512; do
+  python docs/recipes/ascend_bf16_msprobe.py results/linear-inputs-01.pt \
+    --rows "$M" --out "$OUT" || break
+done
+~~~
+
+每个 `m*/L1` 目录保留配置、`dump.json`、输入/权重/输出的三个 `.pt` 和 `summary.json`。终端的 `MSPROBE_L1` 从这三个张量读取第 2、290 行的第 18 通道，并统计这一通道有多少行与第 2 行不同。同目录下的 L2 采集会从 L1 索引读取完整 API 名，每次只采一个 API。下面的命令可导出 M=512 的 MatMul kernel 边界数据，终端会打印实际产生的文件路径。[PyTorch kernel dump 手册](https://github.com/Ascend/mstt/blob/f18c498d31e838ce296960728ed97c2c8880c8b5/debug/accuracy_tools/msprobe/docs/04.kernel_dump_PyTorch.md)
+
+~~~bash
+python docs/recipes/ascend_bf16_msprobe.py results/linear-inputs-01.pt \
+  --rows 512 --out "$OUT" --level L2
+~~~
+
 | 观测 | 下一步验证 |
 | --- | --- |
 | 页边界、完全重复或压力场景命中长度不符 | 看首次 prefill 偏移、KV 页发布覆盖和淘汰前后的查找结果 |
