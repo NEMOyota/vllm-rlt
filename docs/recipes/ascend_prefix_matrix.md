@@ -310,3 +310,12 @@ env -u IGNORE_INFER_ERROR python -m benchmarks.ascend_grouped_kv_cases --model "
 ~~~
 
 `GROUPED_CASE` 中的 `native_reproduced` 检查原生路径是否复现历史 token 分歧。`grouped_off_vs_reuse` 和 `native_off_vs_grouped_off` 分别检查缓存开关一致性与原生冷基线，两项都用空列表表示生成序列相同。每条差异按目标序号、输出 token 位置（从 1 起）、两边的 ID 排列。`grouped_issues` 同时检查命中长度、prefill 起点及 miss 的输出。
+
+如果 grouped 在 `c4_h4` 的目标 2 上第 7 个 token 分歧，可做一次关闭缓存的分块对照。三组均使用 grouped K/V，分别整段算 144 个 token（off）、关闭缓存分 128+16 算（split）、复用 128 个 token 后算 16 个（reuse）。
+
+~~~bash
+env -u IGNORE_INFER_ERROR python -m benchmarks.ascend_grouped_kv_cases \
+  --model "$MODEL" --c4-split --repeats 1
+~~~
+
+查看 `GROUPED_C4_SPLIT`。当 `comparable_at_7=true` 时，脚本已核对缓存命中、实际分块、已知分歧和目标 2 的前六个 token。`focus_at_7` 列出三组在同一生成历史上的两个最高分。`split` 也选 726 表示关闭缓存、改变分块即可在此处复现翻转；若选 302，说明该分块对照不足以复现翻转。完整报告保留四个目标的逐 token 输出与调度记录。

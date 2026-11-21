@@ -99,3 +99,20 @@ def test_grouped_engine_replay_consumes_both_outputs_and_restores_native():
             r["tokens"] for r in joint["requests"]
         ]
     assert model.model.layers[0].self_attn.k_proj.forward == baseline
+
+
+def test_grouped_split_observes_uncached_boundary_and_seventh_decision():
+    from benchmarks.ascend_grouped_kv_cases import replay_split
+    from benchmarks.ascend_prefix_workload import Case
+    from tests.helpers import tiny_ouro_model
+
+    case = Case("c4_h4", "concurrency", 16, 4, concurrency=4, hits=4)
+    result = replay_split(tiny_ouro_model(dtype=torch.bfloat16), "torch", case, reference_grouped)
+    info = result["summary"]
+    assert info["controls"] == []
+    assert not info["prior_grouped_focus_reproduced"] and not info["comparable_at_7"]
+    assert info["hits"] == {"off": [0] * 4, "split": [0] * 4, "reuse": [16] * 4}
+    assert info["focus_prefill"]["split"] == [(0, 16), (16, 4)]
+    for mode, decision in info["focus_at_7"].items():
+        assert decision["position"] == 7
+        assert decision["selected_id"] == result["runs"][mode]["requests"][2]["tokens"][6]
