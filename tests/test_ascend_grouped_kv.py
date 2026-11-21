@@ -77,3 +77,25 @@ def test_npu_grouped_matmul_outputs_k_and_v():
     expected_k, expected_v = ops["native"](x)
     # Each row of each weight selects exactly one signed input, with no rounding ambiguity.
     assert torch.equal(k.cpu(), expected_k.cpu()) and torch.equal(v.cpu(), expected_v.cpu())
+
+
+def test_grouped_engine_replay_consumes_both_outputs_and_restores_native():
+    from benchmarks.ascend_grouped_kv_cases import replay
+    from benchmarks.ascend_prefix_workload import Case
+    from tests.helpers import tiny_ouro_model
+
+    model = tiny_ouro_model(dtype=torch.bfloat16)
+    baseline = model.model.layers[0].self_attn.k_proj.forward
+    # Use short prompts for CPU coverage of donor prefill, cache hit, and decode.
+    case = Case("c4_h4", "concurrency", 16, 4, concurrency=4, hits=4)
+    result = replay(model, "torch", case, reference_grouped)
+    assert result["summary"]["grouped_hits"] == [16] * 4
+    assert result["summary"]["native_off_vs_grouped_off"] == []
+    assert not result["summary"]["native_reproduced"]
+    for arm, rows in result["grouped_calls_by_rows"].items():
+        assert len(rows) >= 2
+        original, joint = (result["trials"][impl][arm] for impl in ("native", "grouped"))
+        assert [r["tokens"] for r in original["requests"]] == [
+            r["tokens"] for r in joint["requests"]
+        ]
+    assert model.model.layers[0].self_attn.k_proj.forward == baseline

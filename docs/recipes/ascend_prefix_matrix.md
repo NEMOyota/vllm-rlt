@@ -302,3 +302,11 @@ env -u IGNORE_INFER_ERROR python -m benchmarks.ascend_grouped_kv \
 - `GROUPED_FIXTURE` 使用文件中的原始输入。`prefix_diffs` 在 `total512_p384` 比较完整 512 行与单算前 384 行，在 `c4_h4` 比较四个槽位的共享前缀与槽位 2。
 - `GROUPED_REVIEW` 分别报告逐位一致性、重复运行稳定性、第 18 列与 FP64 舍入参考值的一致性，以及完成一对 K/V 投影的 p50 毫秒。逐位一致性或重复稳定性失败时退出码为 1，报告会保留。
 - 数值结果自动保存到 `results/grouped-kv-*.json`。`--profile` 在计时后重放三种形状，在 JSON 同名的 `.profile/` 目录分别保存两条路径的设备记录。`GROUPED_DEVICE` 打印采集到的 kernel 名称和次数。`device_rows_available=false` 表示没有读到可用的设备明细。
+
+单算子结果确认后，可在同一块卡上运行三个历史失败用例。脚本在原生与 grouped 两种实现下分别跑 off、miss、reuse，覆盖 donor、目标 prefill 和逐 token decode。每个用例默认跑两次，逐次保存 `results/grouped-kv-cases-*.jsonl`。
+
+~~~bash
+env -u IGNORE_INFER_ERROR python -m benchmarks.ascend_grouped_kv_cases --model "$MODEL"
+~~~
+
+`GROUPED_CASE` 中的 `native_reproduced` 检查原生路径是否复现历史 token 分歧。`grouped_off_vs_reuse` 和 `native_off_vs_grouped_off` 分别检查缓存开关一致性与原生冷基线，两项都用空列表表示生成序列相同。每条差异按目标序号、输出 token 位置（从 1 起）、两边的 ID 排列。`grouped_issues` 同时检查命中长度、prefill 起点及 miss 的输出。
