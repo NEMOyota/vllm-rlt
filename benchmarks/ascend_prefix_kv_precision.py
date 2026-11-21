@@ -18,21 +18,27 @@ from vllm_rlt.models import OuroForCausalLM
 DEFAULT_CASES = ("p1024_s8", "p128_s128", "c4_h4")
 
 
-def run_pair(model, backend, case, output_tokens, seed, projection, layers, chunk_rows):
-    def run(arm):
-        return run_trial(model, backend, case, arm, output_tokens, seed)
+def run_precision_arms(model, backend, case, output_tokens, seed, *, work=None):
+    """Start a fresh engine for each arm and snapshot the active projection counters."""
+    counters = {} if work is None else work
+    trial, work_by_arm = {}, {}
+    for arm in ARMS:
+        for counts in counters.values():
+            counts.clear()
+        trial[arm] = run_trial(model, backend, case, arm, output_tokens, seed)
+        for name, counts in counters.items():
+            if not counts["calls"]:
+                raise RuntimeError(f"{case.name}/{arm}: {name} did not run in FP32")
+        work_by_arm[arm] = {name: dict(counts) for name, counts in counters.items()}
+    return trial, work_by_arm
 
-    native = {arm: run(arm) for arm in ARMS}
-    candidate, work_by_arm = {}, {}
+
+def run_pair(model, backend, case, output_tokens, seed, projection, layers, chunk_rows):
+    native, _ = run_precision_arms(model, backend, case, output_tokens, seed)
     with fp32_kv_projections(model, projection, layers, chunk_rows) as work:
-        for arm in ARMS:
-            for counts in work.values():
-                counts.clear()
-            candidate[arm] = run(arm)
-            for name, counts in work.items():
-                if not counts["calls"]:
-                    raise RuntimeError(f"{case.name}/{arm}: {name} did not run in FP32")
-            work_by_arm[arm] = {name: dict(counts) for name, counts in work.items()}
+        candidate, work_by_arm = run_precision_arms(
+            model, backend, case, output_tokens, seed, work=work
+        )
     return {"native": native, "kv_fp32": candidate}, work_by_arm
 
 

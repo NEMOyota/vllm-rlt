@@ -1,4 +1,4 @@
-"""Scoped Ouro K/V projection interventions for prefix-cache benchmarks."""
+"""Scoped Ouro linear projection interventions for prefix-cache benchmarks."""
 
 from collections import Counter
 from contextlib import ExitStack, contextmanager
@@ -12,7 +12,7 @@ from torch import nn
 
 def _project(forward, rows, counts, input):
     if input.ndim != 2 or input.dtype != torch.bfloat16:
-        raise ValueError("fixed K/V projection requires packed 2D BF16 inputs")
+        raise ValueError("projection requires packed 2D BF16 inputs")
     counts["calls"] += 1
     counts["input_rows"] += input.shape[0]
     if rows is None:
@@ -67,10 +67,21 @@ def _without_hf32(matmul, forward, input):
 
 @contextmanager
 def fp32_kv_projections(model, projection="kv", layers=None, chunk_rows=None):
-    """Run only selected K/V linears in FP32 and return BF16 to attention."""
+    """Keep the K/V benchmark's projection names and work-counter keys."""
     names = {"k": ("k_proj",), "v": ("v_proj",), "kv": ("k_proj", "v_proj")}
     if projection not in names:
         raise ValueError("projection must be k, v or kv")
+    paths = tuple(f"self_attn.{name}" for name in names[projection])
+    with fp32_decoder_projections(model, paths, layers=layers, chunk_rows=chunk_rows) as work:
+        yield {name.replace(".self_attn.", "."): counts for name, counts in work.items()}
+
+
+@contextmanager
+def fp32_decoder_projections(model, paths, *, layers=None, chunk_rows=None):
+    """Patch explicit submodule paths in each selected decoder layer, returning BF16."""
+    paths = tuple(paths)
+    if not paths or len(set(paths)) != len(paths):
+        raise ValueError("choose a nonempty set of distinct decoder projections")
     if chunk_rows is not None and (type(chunk_rows) is not int or chunk_rows < 1):
         raise ValueError("chunk_rows must be a positive integer")
     all_layers = model.model.layers
@@ -82,13 +93,13 @@ def fp32_kv_projections(model, projection="kv", layers=None, chunk_rows=None):
     work = {}
     with ExitStack() as hooks:
         for i in indices:
-            for name in names[projection]:
-                module = getattr(all_layers[i].self_attn, name)
+            for path in paths:
+                module = all_layers[i].get_submodule(path)
                 if not isinstance(module, nn.Linear) or module.weight.dtype != torch.bfloat16:
                     raise ValueError("expected a BF16 Ouro linear projection")
                 weight = module.weight.detach().float()
                 bias = None if module.bias is None else module.bias.detach().float()
-                counts = work[f"layers.{i}.{name}"] = Counter()
+                counts = work[f"layers.{i}.{path}"] = Counter()
                 forward = partial(_project, partial(_fp32_linear, weight, bias), chunk_rows, counts)
                 if weight.device.type == "npu":
                     matmul = getattr(torch.npu, "matmul", None)

@@ -18,7 +18,7 @@ def single_cases():
     return [case for case in suites()["full"] if case.concurrency == 1]
 
 
-def check_trial(case, trials, reference, *, candidate="grouped"):
+def check_trial(case, trials, reference, *, candidate="grouped", candidate_reference=None):
     native, tested = trials["native"], trials[candidate]
     controls, parity_diffs, native_diffs = [], [], []
     for mode, trial in trials.items():
@@ -36,6 +36,10 @@ def check_trial(case, trials, reference, *, candidate="grouped"):
         cold_diffs = compare_outputs(native["off"], tested["off"])
         if drift := compare_outputs(reference, native["off"]):
             controls.append(dict(kind="native_cold_changed_between_repeats", differences=drift))
+        if candidate_reference is not None and (
+            drift := compare_outputs(candidate_reference, tested["off"])
+        ):
+            controls.append(dict(kind="candidate_cold_changed_between_repeats", differences=drift))
     except ValueError as exc:
         controls.append(dict(kind="incomparable_reference", detail=str(exc)))
     return {

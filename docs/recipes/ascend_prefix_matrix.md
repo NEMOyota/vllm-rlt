@@ -343,3 +343,17 @@ python -m benchmarks.ascend_prefix_kv_precision --model "$MODEL"
 默认在所有 Ouro 层的 K 和 V 投影中将输入和权重升到 FP32，计算完立即转回 BF16。每次投影沿用引擎传入的行数。要与已有的定长实验对照，追加 `--chunk-rows 64` 并将 64 换成前一次实际使用的行数。只测第 0 层的 V 投影可追加 `--projection v --layers 0`。选择的投影覆盖 donor 和目标请求的每一轮循环。可重复传入 `--case` 指定其他矩阵用例。
 
 `KV_FP32_CASE` 的 `cache_parity` 表示候选三组输出是否逐 token 一致。`kv_fp32_parity_diffs` 给出首个分歧的请求、位置（从 1 起）与两侧 token ID。`native_off_vs_kv_fp32_off` 单独列出提高精度引起的冷基线变化。`INVALID` 表示命中长度、prefill 起点或其他对照未通过。每轮的完整 token 和各投影调用计数写入 `RESULTS` 指向的 JSONL 文件。结束时，只要出现缓存开关分歧、冷基线变化或无效对照，退出码即为 1。
+
+### 在三个失败用例上筛选第 2、3、4 档
+
+在同一份 Ouro 权重上依次测试三个档位。第 2 档提高各 decoder 层 Q、K、V 的精度。第 3 档加入注意力输出投影 O。第 4 档再加入 MLP 的 gate、up、down 投影。三个档位都把选中投影的输入和权重转为 FP32，按固定行数补零计算，再把有效输出转回 BF16。模型输出头和循环退出门均使用原生计算路径。
+
+~~~bash
+python -m benchmarks.ascend_prefix_precision_tiers --model "$MODEL" --chunk-rows 64
+~~~
+
+`--chunk-rows` 默认 64。与既有实验对照时，填入当时实际使用的行数。脚本固定 seed 168、4 次循环、16 个生成 token，在 `p1024_s8`、`p128_s128` 和 `c4_h4` 上默认各跑两轮。每个用例每轮采一次原生 BF16 对照，各档位用相同的目标请求分别运行 off、miss、reuse。reuse 应依次命中 1024、128、四个 128 token。
+
+`TIER_CASE` 记录该轮开关缓存的一致性、首个分歧、实测命中和相对原生冷基线的变化。默认的 `results/prefix-fp32-tiers-*.jsonl` 还保留各组完整 token、首段 prefill 起点、TTFT 和各模块的实际调用及补零行数。
+
+`TIER_REVIEW.lowest_passing_tier` 给出在这三个用例的每一轮都通过缓存开关对照的最低档位，`null` 表示没有通过的档位。`lowest_passing_tier_matching_native_off` 另外要求所有候选冷输出也与原生冷输出一致。命中或起点错误、重复间冷输出漂移等使对应结果为 `INVALID`。脚本跑完全部数值对照，有无效对照或三个档位都未通过时返回非零退出码。CPU 流程测试可显式加 `--device cpu`，报告里的 `backend` 会记录为 `torch`。
