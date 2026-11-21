@@ -18,11 +18,12 @@ from vllm_rlt.models import OuroForCausalLM
 DEFAULT_CASES = ("p1024_s8", "p128_s128", "c4_h4")
 
 
-def run_precision_arms(model, backend, case, output_tokens, seed, *, work=None):
+def run_precision_arms(model, backend, case, output_tokens, seed, *, work=None, arm_offset=0):
     """Start a fresh engine for each arm and snapshot the active projection counters."""
     counters = {} if work is None else work
     trial, work_by_arm = {}, {}
-    for arm in ARMS:
+    offset = arm_offset % len(ARMS)
+    for arm in ARMS[offset:] + ARMS[:offset]:
         for counts in counters.values():
             counts.clear()
         trial[arm] = run_trial(model, backend, case, arm, output_tokens, seed)

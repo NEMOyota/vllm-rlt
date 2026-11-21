@@ -357,3 +357,15 @@ python -m benchmarks.ascend_prefix_precision_tiers --model "$MODEL" --chunk-rows
 `TIER_CASE` 记录该轮开关缓存的一致性、首个分歧、实测命中和相对原生冷基线的变化。默认的 `results/prefix-fp32-tiers-*.jsonl` 还保留各组完整 token、首段 prefill 起点、TTFT 和各模块的实际调用及补零行数。
 
 `TIER_REVIEW.lowest_passing_tier` 给出在这三个用例的每一轮都通过缓存开关对照的最低档位，`null` 表示没有通过的档位。`lowest_passing_tier_matching_native_off` 另外要求所有候选冷输出也与原生冷输出一致。命中或起点错误、重复间冷输出漂移等使对应结果为 `INVALID`。脚本跑完全部数值对照，有无效对照或三个档位都未通过时返回非零退出码。CPU 流程测试可显式加 `--device cpu`，报告里的 `backend` 会记录为 `torch`。
+
+### 第 3 档全量回归
+
+~~~bash
+python -m benchmarks.ascend_prefix_precision_tiers --tier3-full --model "$MODEL"
+~~~
+
+该模式从 full 矩阵读取全部 29 个用例，包括 `total512_p384`、部分命中的并发请求、整页边界、驻留和驱逐。候选沿用筛选时的 Q/K/V/O 投影、FP32 定长 64 行、BF16 输出。固定 seed 168、4 次循环、生成 16 个 token。原生 BF16 对照和第 3 档每例各跑一次预热和五次正式重复，每次轮换 off、miss、reuse 的执行顺序。预热也参加正确性检查。耗时和吞吐只统计五次正式重复。
+
+最后的 `TIER_REVIEW` 中，`tiers["3"].passed_cases` 是通过的用例数，`cache_parity_failed` 列出缓存开关输出分歧，`invalid` 列出命中、prefill 起点或重复稳定性等对照失败的用例。`native_cold_changed` 单列与原生 BF16 冷输出有差异的用例。出现输出分歧后仍继续跑其余用例，档内分歧或无效对照使最终退出码为 1。
+
+`RESULTS` 指向按轮写入的 JSONL，包含首个分歧 token 和各请求的原始记录。`CSV` 指向逐用例写入的同名 CSV，包含三组的绝对 TTFT p50/p95、输出吞吐和 reuse 命中量。通过用例的 `reuse_vs_miss_ttft_p50_saved_ms` 为 miss 减 reuse，正数表示命中后更快。
