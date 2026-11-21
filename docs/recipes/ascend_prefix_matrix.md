@@ -288,3 +288,17 @@ MODEL="$MODEL" BASELINE=results/prefix-baseline.json bash docs/recipes/ascend_ma
 `BASELINE` 使用原生环境、正常 GE 校验下保存的完整矩阵，保留相同模型、设备、种子、预热次数、重复次数和输出长度。老报告若未记录环境变量，需从当时的启动配置确认。公开路径按原生引擎计时，另做一次每臂同负载重放记录 K/V 形状，随后对出现的形状用独立单算子采集核对分派。报告列出两边的 CANN、torch 和 torch_npu 版本。跨版本 TTFT 反映整个软件栈变化。与维护者对齐所支持的硬件、数据类型及 shape 范围，并附三个历史失败用例、完整矩阵、缓存命中和 TTFT 后，再决定是否调整默认分派。
 
 若公开入口仍选 V2，可向 CANN ops-nn 提交最小复现并请维护者确认 910B4 的公开分派策略。建议分别记录 GE 单算子 dtype 推导失败和 BF16 复制行的数值差异。显式桥接只改变 Ouro K/V。更新公共分派规则也可能改变其他同形状的投影，需用真实引擎回归。在 9.0.0 的 MatMulV3 基础 tiling 代码中，`0x4` 对应的强制分组累加路径要求 FP32 输入。BF16 实验应分别报告跨行一致性和参考舍入值。
+
+### 910B4 上的 GroupedMatmul K/V 输出对照
+
+在仓库根目录使用之前保存的投影输入和 Ouro K/V 权重。基线对同一输入调用两次 `F.linear`，候选通过一次 `torch_npu.npu_grouped_matmul([x, x], [wk.T, wv.T], split_item=0, group_type=-1)` 分别返回 K 和 V。脚本先用只有一个非零元素的输入验证两个输出的顺序及权重转置，再对真实输入进行比较。[torch_npu 接口文档](https://github.com/Ascend/op-plugin/blob/dedc316708372c9a8bfde4527abd2a94b74840f5/docs/zh/custom_APIs/torch_npu/torch_npu-npu_grouped_matmul.md)
+
+~~~bash
+env -u IGNORE_INFER_ERROR python -m benchmarks.ascend_grouped_kv \
+  --fixture results/linear-inputs-20261119T092602.pt --profile
+~~~
+
+- `GROUPED_ROW` 给出复制第 2 行后的结果，覆盖 M=384、512、576。看 K 和 V 的 `within_m`（同一形状内相对首行的不同元素数）、`vs_largest_m`（与 M=576 对应行的差异）和 `ch18_runs`（第 18 列的连续取值及行范围）。
+- `GROUPED_FIXTURE` 使用文件中的原始输入。`prefix_diffs` 在 `total512_p384` 比较完整 512 行与单算前 384 行，在 `c4_h4` 比较四个槽位的共享前缀与槽位 2。
+- `GROUPED_REVIEW` 分别报告逐位一致性、重复运行稳定性、第 18 列与 FP64 舍入参考值的一致性，以及完成一对 K/V 投影的 p50 毫秒。逐位一致性或重复稳定性失败时退出码为 1，报告会保留。
+- 数值结果自动保存到 `results/grouped-kv-*.json`。`--profile` 在计时后重放三种形状，在 JSON 同名的 `.profile/` 目录分别保存两条路径的设备记录。`GROUPED_DEVICE` 打印采集到的 kernel 名称和次数。`device_rows_available=false` 表示没有读到可用的设备明细。
