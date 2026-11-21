@@ -319,3 +319,15 @@ env -u IGNORE_INFER_ERROR python -m benchmarks.ascend_grouped_kv_cases \
 ~~~
 
 查看 `GROUPED_C4_SPLIT`。当 `comparable_at_7=true` 时，脚本已核对缓存命中、实际分块、已知分歧和目标 2 的前六个 token。`focus_at_7` 列出三组在同一生成历史上的两个最高分。`split` 也选 726 表示关闭缓存、改变分块即可在此处复现翻转；若选 302，说明该分块对照不足以复现翻转。完整报告保留四个目标的逐 token 输出与调度记录。
+
+#### 全量单请求输出回归
+
+脚本自动选取现有 full 矩阵中 `concurrency == 1` 的全部 23 项，每轮同时提交一个目标请求。覆盖前缀长度、页边界、相同 prompt、固定总长下的前缀占比、不同后缀长度以及缓存驻留与驱逐。19 项在 reuse 组应命中，另 4 项预期零命中。其中 `repeat_p128` 和 `total512_p512` 的整段 prompt 相同，按 16-token 完整页复用并保留末尾 token 重算，预期分别命中 112 和 496 个 token。`evicted_p64` 会核对驱逐前命中 64、驱逐后命中 0。
+
+~~~bash
+env -u IGNORE_INFER_ERROR python -m benchmarks.ascend_grouped_kv_single --model "$MODEL"
+~~~
+
+默认 seed 为 168，每个用例重复两次，各生成 16 个 token。可通过 `--list` 查看用例与预期命中数，通过 `--seed`、`--output-tokens`、`--repeats` 修改实验条件。每轮对相同目标 prompt 分别使用原生和 grouped K/V，各跑 off、miss、reuse 三组。`PASS` 要求 grouped 三组输出逐 token 一致、grouped off 与原生 off 一致、原生冷基线在重复间稳定，且命中与 prefill 起点等对照均通过。已知的原生 reuse 分歧单列在 `native_reuse_diverged` 中。
+
+数值失败会继续执行后续用例。`GROUPED_C1_FAIL` 打印用例、轮次与首个分歧位置；最后的 `GROUPED_C1_REVIEW` 列出通过数与失败用例。默认的 `results/grouped-kv-single-*.jsonl` 按轮保存 token、命中、起点及 grouped 调用次数。用 `--out` 可指定新的报告路径。

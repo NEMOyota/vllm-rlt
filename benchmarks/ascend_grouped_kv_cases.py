@@ -77,7 +77,7 @@ def compare_outputs(reference, candidate):
     return diffs
 
 
-def replay(model, backend, case, grouped_matmul):
+def run_projection_trials(model, backend, case, grouped_matmul, output_tokens, seed):
     trials, calls_by_arm = {}, {}
     for mode in ("native", "grouped"):
         with ExitStack() as stack:
@@ -88,11 +88,16 @@ def replay(model, backend, case, grouped_matmul):
             trials[mode] = {}
             for arm in ARMS:
                 calls.clear()
-                trials[mode][arm] = run_trial(model, backend, case, arm, 16, 168)
+                trials[mode][arm] = run_trial(model, backend, case, arm, output_tokens, seed)
                 if mode == "grouped":
                     if not calls:
                         raise RuntimeError(f"{arm}: no grouped calls")
                     calls_by_arm[arm] = dict(calls)
+    return trials, calls_by_arm
+
+
+def replay(model, backend, case, grouped_matmul):
+    trials, calls_by_arm = run_projection_trials(model, backend, case, grouped_matmul, 16, 168)
     native, grouped = trials["native"], trials["grouped"]
     native_diff = compare_outputs(native["off"], native["reuse"])
     issues = {mode: list(_mismatches(case, [trial])) for mode, trial in trials.items()}
