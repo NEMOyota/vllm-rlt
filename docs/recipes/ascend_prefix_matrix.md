@@ -331,3 +331,15 @@ env -u IGNORE_INFER_ERROR python -m benchmarks.ascend_grouped_kv_single --model 
 默认 seed 为 168，每个用例重复两次，各生成 16 个 token。可通过 `--list` 查看用例与预期命中数，通过 `--seed`、`--output-tokens`、`--repeats` 修改实验条件。每轮对相同目标 prompt 分别使用原生和 grouped K/V，各跑 off、miss、reuse 三组。`PASS` 要求 grouped 三组输出逐 token 一致、grouped off 与原生 off 一致、原生冷基线在重复间稳定，且命中与 prefill 起点等对照均通过。已知的原生 reuse 分歧单列在 `native_reuse_diverged` 中。
 
 数值失败会继续执行后续用例。`GROUPED_C1_FAIL` 打印用例、轮次与首个分歧位置；最后的 `GROUPED_C1_REVIEW` 列出通过数与失败用例。默认的 `results/grouped-kv-single-*.jsonl` 按轮保存 token、命中、起点及 grouped 调用次数。用 `--out` 可指定新的报告路径。
+
+### 只提高 K/V 投影精度
+
+这个实验重跑 K/V 定长 FP32 验证中出现分歧的 `p1024_s8`、`p128_s128` 和 `c4_h4`。每个用例默认重复两轮，原生 BF16 与候选各跑 off、miss、reuse，使用相同目标 prompt、seed 168 和 16 个输出 token。
+
+~~~bash
+python -m benchmarks.ascend_prefix_kv_precision --model "$MODEL"
+~~~
+
+默认在所有 Ouro 层的 K 和 V 投影中将输入和权重升到 FP32，计算完立即转回 BF16。每次投影沿用引擎传入的行数。要与已有的定长实验对照，追加 `--chunk-rows 64` 并将 64 换成前一次实际使用的行数。只测第 0 层的 V 投影可追加 `--projection v --layers 0`。选择的投影覆盖 donor 和目标请求的每一轮循环。可重复传入 `--case` 指定其他矩阵用例。
+
+`KV_FP32_CASE` 的 `cache_parity` 表示候选三组输出是否逐 token 一致。`kv_fp32_parity_diffs` 给出首个分歧的请求、位置（从 1 起）与两侧 token ID。`native_off_vs_kv_fp32_off` 单独列出提高精度引起的冷基线变化。`INVALID` 表示命中长度、prefill 起点或其他对照未通过。每轮的完整 token 和各投影调用计数写入 `RESULTS` 指向的 JSONL 文件。结束时，只要出现缓存开关分歧、冷基线变化或无效对照，退出码即为 1。

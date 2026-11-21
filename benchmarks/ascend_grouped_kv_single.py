@@ -18,34 +18,34 @@ def single_cases():
     return [case for case in suites()["full"] if case.concurrency == 1]
 
 
-def check_trial(case, trials, reference):
-    native, grouped = trials["native"], trials["grouped"]
-    controls, grouped_diffs, native_diffs = [], [], []
+def check_trial(case, trials, reference, *, candidate="grouped"):
+    native, tested = trials["native"], trials[candidate]
+    controls, parity_diffs, native_diffs = [], [], []
     for mode, trial in trials.items():
         for mismatch in _mismatches(case, [trial]):
             # The enclosing JSONL record carries the actual repeat index.
             del mismatch["trial"]
-            if mismatch["kind"] == "output_vs_off" and mode == "grouped":
-                grouped_diffs.append(mismatch)
+            if mismatch["kind"] == "output_vs_off" and mode == candidate:
+                parity_diffs.append(mismatch)
             elif mismatch["kind"] == "output_vs_off" and mismatch["arm"] == "reuse":
                 native_diffs.append(mismatch)
             else:
                 controls.append(dict(mode=mode, **mismatch))
     cold_diffs = []
     try:
-        cold_diffs = compare_outputs(native["off"], grouped["off"])
+        cold_diffs = compare_outputs(native["off"], tested["off"])
         if drift := compare_outputs(reference, native["off"]):
             controls.append(dict(kind="native_cold_changed_between_repeats", differences=drift))
     except ValueError as exc:
         controls.append(dict(kind="incomparable_reference", detail=str(exc)))
-    return dict(
-        passed=not (grouped_diffs or cold_diffs or controls),
-        grouped_parity_diffs=grouped_diffs,
-        native_off_vs_grouped_off=cold_diffs,
-        controls=controls,
-        native_off_vs_reuse=native_diffs,
-        grouped_reuse_hits=[r["hit_tokens"] for r in grouped["reuse"]["requests"]],
-    )
+    return {
+        "passed": not (parity_diffs or cold_diffs or controls),
+        f"{candidate}_parity_diffs": parity_diffs,
+        f"native_off_vs_{candidate}_off": cold_diffs,
+        "controls": controls,
+        "native_off_vs_reuse": native_diffs,
+        f"{candidate}_reuse_hits": [r["hit_tokens"] for r in tested["reuse"]["requests"]],
+    }
 
 
 def write_record(stream, **fields):
