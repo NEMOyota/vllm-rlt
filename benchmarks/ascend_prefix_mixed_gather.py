@@ -186,31 +186,32 @@ def token_diffs(reference, actual):
         return [dict(error=str(exc))]
 
 
-def paired_ms(original, changed, candidate):
+def paired_ms(original, changed, candidate, baseline="original"):
     saved = [a - b for a, b in zip(original, changed, strict=True)]
     return {
-        "original_ms": round(median(original), 2),
+        f"{baseline}_ms": round(median(original), 2),
         f"{candidate}_ms": round(median(changed), 2),
         "paired_saved_ms": [round(x, 2) for x in saved],
         "median_paired_saved_ms": round(median(saved), 2),
     }
 
 
-def ttft_review(measured, candidate="merged"):
+def ttft_review(measured, candidate="merged", baseline="original"):
     # Four requests in one burst are correlated. Pair variants within each repeat.
     times = {
         arm: {
             mode: [median(r["ttft_ms"] for r in pair[mode][arm]["requests"]) for pair in measured]
-            for mode in ("original", candidate)
+            for mode in (baseline, candidate)
         }
         for arm in ARMS
     }
     times["reuse_minus_miss"] = {
         mode: [r - m for r, m in zip(times["reuse"][mode], times["miss"][mode], strict=True)]
-        for mode in ("original", candidate)
+        for mode in (baseline, candidate)
     }
     return {
-        arm: paired_ms(p50["original"], p50[candidate], candidate) for arm, p50 in times.items()
+        arm: paired_ms(p50[baseline], p50[candidate], candidate, baseline)
+        for arm, p50 in times.items()
     }
 
 
@@ -219,6 +220,8 @@ class GateFailure(RuntimeError):
 
 
 class Pairs:
+    case_name = "c4_h1"
+    intermediate_modes = ()
     label = "GATHER"
     candidate = "merged"
     audit_scope = "target mixed-prefill flat K/V Tensor.index_select calls"
@@ -234,7 +237,8 @@ class Pairs:
         self.reference = reference
         self.runs = []
         self.counts = Counter()
-        self.audits = {"original": {}, self.candidate: {}}
+        self.modes = ("original", *self.intermediate_modes, self.candidate)
+        self.audits = {mode: {} for mode in self.modes}
         self.repeats = repeats
         self.trace_dir = trace_dir
         self.traces = {}
@@ -242,12 +246,15 @@ class Pairs:
     def record(self, kind, **fields):
         print(json.dumps(dict(kind=kind, **fields), allow_nan=False), file=self.stream, flush=True)
 
+    def variant_route(self, mode, audit):
+        return self.route(mode == self.candidate, audit)
+
     def run_variant(self, mode, audit, trial_args, trial_kwargs, profile_target=None):
         burst = workload._target_burst
 
         def target(engine, targets, params, expected):
             profile = profile_target(engine, targets) if profile_target else nullcontext()
-            with profile, self.route(mode == self.candidate, audit):
+            with profile, self.variant_route(mode, audit):
                 return burst(engine, targets, params, expected)
 
         with patch.object(workload, "_target_burst", target):
@@ -274,11 +281,10 @@ class Pairs:
         repeat = self.counts[arm]
         self.counts[arm] += 1
         if repeat == len(self.runs):
-            self.runs.append({"original": {}, self.candidate: {}})
+            self.runs.append({mode: {} for mode in self.modes})
         pair = self.runs[repeat]
-        order = ["original", self.candidate]
-        if (repeat + ARMS.index(arm)) % 2:
-            order.reverse()
+        offset = (repeat + ARMS.index(arm)) % len(self.modes)
+        order = self.modes[offset:] + self.modes[:offset]
         for mode in order:
             audit = self.new_audit() if repeat == 0 else None
             trial = self.run_variant(
@@ -312,8 +318,9 @@ class Pairs:
                     for diff in token_diffs(self.reference, arms[a]):
                         issues.append(dict(mode=mode, arm=a, check="vs_reference_off", **diff))
             for a in ARMS:
-                for diff in token_diffs(pair["original"][a], pair[self.candidate][a]):
-                    issues.append(dict(arm=a, check=f"original_vs_{self.candidate}", **diff))
+                for mode in self.modes[1:]:
+                    for diff in token_diffs(pair["original"][a], pair[mode][a]):
+                        issues.append(dict(mode=mode, arm=a, check=f"original_vs_{mode}", **diff))
             if repeat == 0:
                 calls = model.config.num_hidden_layers * model.config.total_ut_steps
                 issues.extend(self.audit_issues(self.audits, calls))
@@ -325,7 +332,9 @@ class Pairs:
                 flush=True,
             )
             if issues:
-                raise GateFailure(f"c4_h1 gate failed on repeat {repeat}; see {self.label}_GATE")
+                raise GateFailure(
+                    f"{self.case_name} gate failed on repeat {repeat}; see {self.label}_GATE"
+                )
             if self.trace_dir is not None and repeat == self.repeats:
                 # The server's all-Linear patch is still active here. Keep trace replays
                 # out of timing samples and retain the measurements if trace export fails.
@@ -338,13 +347,13 @@ class Pairs:
         return pair["original"][arm]
 
 
-def reference_settings(path):
+def reference_settings(path, case_name="c4_h1"):
     if path is None:
         return None, None
     report = json.loads(path.read_text())
-    case = report["cases"]["c4_h1"]
+    case = report["cases"][case_name]
     if report["state"] != "complete" or case["summary"]["status"] != "PASS":
-        raise ValueError("reference must contain a completed, passing c4_h1 matrix run")
+        raise ValueError(f"reference must contain a completed, passing {case_name} matrix run")
     rows = None
     for section in (report.get("contract", {}), report.get("metadata", {}), report):
         for key in (
@@ -366,13 +375,14 @@ def reference_settings(path):
 
 def main(argv=None, *, pair_type=Pairs, description=__doc__):
     tag = pair_type.label.lower()
+    case_name = pair_type.case_name
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--model", required=True, type=Path)
     parser.add_argument("--reference", type=Path, help="accepted full FP32 matrix JSON")
     parser.add_argument("--chunk-rows", type=int, help="same value as the accepted FP32 run")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument(
-        "--out-dir", type=Path, help=f"new directory (default: results/{tag}-c4_h1-UTC)"
+        "--out-dir", type=Path, help=f"new directory (default: results/{tag}-{case_name}-UTC)"
     )
     if pair_type.profile_pair is not None:
         parser.add_argument(
@@ -381,7 +391,7 @@ def main(argv=None, *, pair_type=Pairs, description=__doc__):
             help="after passing timing gates, trace one fresh reuse burst per variant",
         )
     args = parser.parse_args(argv)
-    saved_rows, reference = reference_settings(args.reference)
+    saved_rows, reference = reference_settings(args.reference, case_name)
     rows = args.chunk_rows if args.chunk_rows is not None else saved_rows
     if rows is None or rows < 1:
         parser.error("supply --chunk-rows with the --linear-fp32-chunk value of the accepted run")
@@ -390,7 +400,7 @@ def main(argv=None, *, pair_type=Pairs, description=__doc__):
     if not args.model.is_dir() or args.repeats < 1:
         parser.error("provide a local model directory and at least one measured repeat")
     out = args.out_dir or Path("results") / datetime.now(timezone.utc).strftime(
-        f"{tag}-c4_h1-%Y%m%dT%H%M%S%fZ"
+        f"{tag}-{case_name}-%Y%m%dT%H%M%S%fZ"
     )
     out.mkdir(parents=True, exist_ok=False)
     report = out / f"{tag}.jsonl"
@@ -405,15 +415,16 @@ def main(argv=None, *, pair_type=Pairs, description=__doc__):
         )
         pairs.record(
             "config",
-            case="c4_h1",
+            case=case_name,
             precision="local matrix --linear-fp32-chunk",
             chunk_rows=rows,
             repeats=args.repeats,
             seed=168,
             output_tokens=16,
             candidate=pairs.candidate,
+            modes=pairs.modes,
             audit_scope=pairs.audit_scope,
-            ttft_definition=f"burst median (ms), paired_saved_ms = original - {pairs.candidate}",
+            ttft_definition="burst median (ms), paired_saved_ms = baseline - candidate",
             reference=str(args.reference) if args.reference else "live original/off",
         )
         try:
@@ -425,7 +436,7 @@ def main(argv=None, *, pair_type=Pairs, description=__doc__):
                         "--device",
                         "npu",
                         "--case",
-                        "c4_h1",
+                        case_name,
                         "--linear-fp32-chunk",
                         str(rows),
                         "--output-tokens",
@@ -446,7 +457,7 @@ def main(argv=None, *, pair_type=Pairs, description=__doc__):
                 )
             review = dict(
                 status="PASS",
-                case="c4_h1",
+                case=case_name,
                 measured_pairs=args.repeats,
                 **pairs.timing_summary(),
             )

@@ -27,44 +27,58 @@ else:  # Both scripts can be exported side by side, outside the server's patched
 
 @dataclass
 class ColdBatch:
-    """A private write-slot/mask cache for three complete prompts at one loop depth."""
+    """A private write-slot/mask cache for equal-length complete prompts at one loop depth."""
 
     cold_rows: slice | torch.Tensor
-    hot_group: tuple
+    hot_groups: list
+    cold_count: int
     width: int
     write_blocks: torch.Tensor
     write_offsets: torch.Tensor
     kernel: AscendEagerAttention = field(default_factory=AscendEagerAttention)
 
     @classmethod
-    def plan(cls, batch, groups):
+    def plan(cls, batch, groups, cold_count=3):
         cold = [g for g in groups if g[4]]  # _plan already verified positions 0..width-1.
         hot = [g for g in groups if not g[4]]
-        if len(cold) != 3 or len(hot) != 1 or hot[0][1].numel() <= 1:
+        if (
+            len(cold) != cold_count
+            or len(hot) != 4 - cold_count
+            or any(g[1].numel() <= 1 for g in hot)
+        ):
             return None
         width = cold[0][1].numel()
         if width <= 1 or any(g[1].numel() != width for g in cold):
             return None
-        if len({batch.rows[g[0]][1] for g in groups}) != 1 or batch.rows[hot[0][0]][2] <= 0:
+        if len({batch.rows[g[0]][1] for g in groups}) != 1 or any(
+            batch.rows[g[0]][2] <= 0 for g in hot
+        ):
             return None
 
         start = cold[0][0]
-        cold_rows = slice(start, start + 3 * width)
-        if _prefill_geometry(batch.rows[cold_rows]) != (3, width):
-            # A hot request can sit between cold requests. Pack the same three groups in
+        cold_rows = slice(start, start + cold_count * width)
+        if _prefill_geometry(batch.rows[cold_rows]) != (cold_count, width):
+            # A hot request can sit between cold requests. Pack the cold groups in
             # their original order and scatter by their actual query indices.
             cold_rows = torch.cat([g[1] for g in cold])
         return cls(
-            cold_rows, hot[0], width, batch.write_blocks[cold_rows], batch.write_offsets[cold_rows]
+            cold_rows,
+            hot,
+            cold_count,
+            width,
+            batch.write_blocks[cold_rows],
+            batch.write_offsets[cold_rows],
+        )
+
+    def suffixes(self, native, owner, q, keys, values, tables, flat_rows, result):
+        return native(
+            owner, q, keys, values, tables, self.hot_groups, flat_rows=flat_rows, result=result
         )
 
     def apply(self, native, owner, q, keys, values, tables, flat_rows, result):
-        # The suffix keeps the complete per-request block table and absolute causal mask.
-        result = native(
-            owner, q, keys, values, tables, [self.hot_group], flat_rows=flat_rows, result=result
-        )
+        result = self.suffixes(native, owner, q, keys, values, tables, flat_rows, result)
         cold = self.kernel._batched_prefill(
-            q[self.cold_rows], keys, values, self, flat_rows, (3, self.width)
+            q[self.cold_rows], keys, values, self, flat_rows, (self.cold_count, self.width)
         )
         if isinstance(self.cold_rows, slice):
             result[self.cold_rows].copy_(cold)
@@ -73,7 +87,7 @@ class ColdBatch:
         return result
 
 
-def split_forward(native, audit):
+def split_forward(native, audit, plan_batch=ColdBatch.plan):
     last_batch = last_layout = plan = None
 
     def forward(owner, q, keys, values, tables, groups, *, flat_rows=None, result=None):
@@ -82,7 +96,7 @@ def split_forward(native, audit):
         if batch is not None and flat_rows is not None and len(groups) == 4:
             layout = (flat_rows[2], flat_rows[0].shape[0], q.dtype, q.device)
             if batch is not last_batch or layout != last_layout:
-                plan = ColdBatch.plan(batch, groups)
+                plan = plan_batch(batch, groups)
                 last_batch, last_layout = batch, layout
             if plan is not None:
                 if audit is not None:
@@ -120,7 +134,7 @@ def count_attention_calls(audit):
 
 
 @contextmanager
-def route(enabled, audit):
+def route(enabled, audit, *, cold_count=3, plan_batch=ColdBatch.plan):
     if not enabled and audit is None:
         yield
         return
@@ -139,7 +153,7 @@ def route(enabled, audit):
             )
         mixed = (
             len(spans) == 4
-            and sum(s.token_start == 0 for s in spans) == 3
+            and sum(s.token_start == 0 for s in spans) == cold_count
             and all(
                 s.token_start == s.request.prefill_window_origin
                 and s.token_count > 1
@@ -155,7 +169,7 @@ def route(enabled, audit):
                     patch.object(
                         AscendEagerAttention,
                         "_forward",
-                        split_forward(AscendEagerAttention._forward, audit),
+                        split_forward(AscendEagerAttention._forward, audit, plan_batch),
                     )
                 )
             return execute(runner, schedule, prepared)
@@ -190,6 +204,8 @@ def first_tokens(engine, targets, *, profiler, directory, mode):
 class ThreePlusOne(paired.Pairs):
     label = "THREE_PLUS_ONE"
     candidate = "three_plus_one"
+    cold_count = 3
+    batched_suffix_mode = None
     stock_methods = (*paired.Pairs.stock_methods, "_batched_prefill")
     audit_scope = "target prefill attention matmul calls and softmax [batch,queries,keys] shapes"
     route = staticmethod(route)
@@ -205,14 +221,19 @@ class ThreePlusOne(paired.Pairs):
         issues = []
         for mode, arms in audits.items():
             for arm, audit in arms.items():
-                split = arm == "reuse" and mode == cls.candidate
+                split = arm == "reuse" and mode != "original"
                 shapes = {"4x144x144": calls}
                 if arm == "reuse":
-                    shapes = {"1x16x144": calls}
-                    shapes.update({"3x144x144": calls} if split else {"1x144x144": 3 * calls})
+                    hot = 4 - cls.cold_count
+                    cold_batch = cls.cold_count if split else 1
+                    hot_batch = hot if mode == cls.batched_suffix_mode else 1
+                    shapes = {
+                        f"{cold_batch}x144x144": calls * (cls.cold_count // cold_batch),
+                        f"{hot_batch}x16x144": calls * (hot // hot_batch),
+                    }
                 spans = [
                     [f"target-{i}", 128, 16]
-                    if i == 0 and arm == "reuse"
+                    if i < 4 - cls.cold_count and arm == "reuse"
                     else [f"target-{i}", 0, 144]
                     for i in range(4)
                 ]
