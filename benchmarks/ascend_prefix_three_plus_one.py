@@ -222,6 +222,9 @@ class ThreePlusOne(paired.Pairs):
 
     def audit_issues(self, audits, calls):
         case = next(c for c in suites()["full"] if c.name == self.case_name)
+        return self.concurrency_audit_issues(case, audits, calls)
+
+    def concurrency_audit_issues(self, case, audits, calls):
         size = case.concurrency
         total = case.prefix + case.suffix
         issues = []

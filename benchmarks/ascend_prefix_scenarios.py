@@ -6,6 +6,8 @@ from benchmarks.ascend_prefix_workload import Case
 from benchmarks.preemption import percentile
 
 ARMS = ("off", "miss", "reuse")
+# An explicitly selected case outside the archived 29-case suite.
+C4_H3 = Case("c4_h3", "concurrency", 128, 16, concurrency=4, hits=3)
 
 
 def suites():

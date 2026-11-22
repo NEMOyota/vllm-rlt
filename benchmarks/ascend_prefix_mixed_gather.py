@@ -376,7 +376,10 @@ def reference_settings(path, case_name="c4_h1"):
     case = report["cases"][case_name]
     if report["state"] != "complete" or case["summary"]["status"] != "PASS":
         raise ValueError(f"reference must contain a completed, passing {case_name} matrix run")
-    rows = None
+    return reference_chunk_rows(report), case["trials"][0]["off"]
+
+
+def reference_chunk_rows(report):
     for section in (report.get("contract", {}), report.get("metadata", {}), report):
         for key in (
             "linear_fp32_chunk",
@@ -388,11 +391,8 @@ def reference_settings(path, case_name="c4_h1"):
             if isinstance(value, dict):
                 value = value.get("chunk_rows")
             if type(value) is int and value > 0:
-                rows = value
-                break
-        if rows is not None:
-            break
-    return rows, case["trials"][0]["off"]
+                return value
+    return None
 
 
 def argument_parser(pair_type, description, *, reference_required=False):

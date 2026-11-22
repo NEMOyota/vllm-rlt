@@ -14,7 +14,7 @@ from tempfile import NamedTemporaryFile
 import torch
 
 from benchmarks.ascend_prefix_history import compare_baseline
-from benchmarks.ascend_prefix_scenarios import ARMS, suites, summarize
+from benchmarks.ascend_prefix_scenarios import ARMS, C4_H3, suites, summarize
 from benchmarks.ascend_prefix_workload import Case, run_trial
 from benchmarks.preemption import checkpoint_identity
 from vllm_rlt.device import resolve_device
@@ -300,7 +300,7 @@ def main(argv=None):
         help="Measure native K/V projection shapes for device dispatch verification",
     )
     parser.add_argument(
-        "--case", action="append", help="Select a named case from the full suite (repeatable)"
+        "--case", action="append", help="Select a named case (repeatable, see --list)"
     )
     parser.add_argument(
         "--shape",
@@ -330,7 +330,7 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
     presets = suites()
-    full = {case.name: case for case in presets["full"]}
+    full = {case.name: case for case in (*presets["full"], C4_H3)}
     if args.list:
         for case in full.values():
             print(json.dumps(asdict(case)))
