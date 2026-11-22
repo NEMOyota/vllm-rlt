@@ -1,4 +1,4 @@
-"""Reporting shared by the native-BF16 engine and HTTP experiments."""
+"""Reporting shared by the synchronous engine and HTTP prefix experiments."""
 
 import csv
 import hashlib
@@ -10,6 +10,7 @@ from pathlib import Path
 from statistics import median
 
 from benchmarks.ascend_main_prefix_combo import environment
+from benchmarks.ascend_main_prefix_linear import precision_settings
 from benchmarks.preemption import checkpoint_identity, percentile
 from vllm_rlt.device import resolve_device
 
@@ -46,9 +47,11 @@ def write_csv(path, rows):
 
 
 class Report:
-    def __init__(self, kind, folder):
+    def __init__(self, kind, folder, *, linear_fp32_chunk=None):
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        self.folder = folder or Path("results") / f"main-prefix-{kind.lower()}-{stamp}"
+        self.math = precision_settings(linear_fp32_chunk)
+        suffix = "" if linear_fp32_chunk is None else f"-fp32-r{linear_fp32_chunk}"
+        self.folder = folder or Path("results") / f"main-prefix-{kind.lower()}{suffix}-{stamp}"
         self.folder.mkdir(exist_ok=False, parents=True)
         self.kind = kind
         self.location = {}
@@ -56,13 +59,13 @@ class Report:
         print("RESULTS", self.folder.resolve(), flush=True)
 
     def record(self, tag, *, echo=False, **data):
-        line = json.dumps(dict(kind=tag, **data), allow_nan=False)
+        line = json.dumps(dict(kind=tag) | self.math | data, allow_nan=False)
         print(line, file=self.stream, flush=True)
         if echo:
-            print(tag, json.dumps(data, allow_nan=False), flush=True)
+            print(tag, json.dumps(self.math | data, allow_nan=False), flush=True)
 
     def review(self, status, **data):
-        result = dict(status=status, **data)
+        result = self.math | dict(status=status, **data)
         (self.folder / "review.json").write_text(json.dumps(result, indent=2) + "\n")
         self.record(self.kind + "_REVIEW", echo=True, **result)
         return {"PASS": 0, "FAIL": 1, "INCOMPLETE": 2}[status]
@@ -75,7 +78,10 @@ class Report:
 
             torch.npu.set_device(device)
             info = environment(device)
-            info["execution"] = "native BF16, single-stream synchronous ascend_eager, packed SDPA"
+            info["execution"] = "single-stream synchronous ascend_eager, BF16 KV and packed SDPA"
+            info["native_allow_hf32"] = getattr(
+                getattr(torch.npu, "matmul", None), "allow_hf32", None
+            )
             if self.kind == "SERVICE":
                 info.update(seed=args.seed, output_tokens=[8, 16])
             self.record(

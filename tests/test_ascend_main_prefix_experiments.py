@@ -158,7 +158,7 @@ def test_inherited_bf16_drift_retains_trials_and_excludes_benefit(tmp_path, monk
 
     from benchmarks.ascend_main_prefix_results import Report
 
-    def inject(model, case, mode, arm, inputs):
+    def inject(model, case, mode, arm, inputs, *, linear_work=None):
         seq = [1] * 16 if arm != "reuse" else [2] * 16
         return dict(
             requests={
@@ -189,3 +189,42 @@ def test_inherited_bf16_drift_retains_trials_and_excludes_benefit(tmp_path, monk
     entries = [json.loads(line) for line in (report.folder / "raw.jsonl").read_text().splitlines()]
     assert len([r for r in entries if r["kind"] == "TRIAL"]) == 6
     assert next(r for r in entries if r["kind"] == "CASE_DETAILS")["paired_ttft"] == {}
+
+
+def test_fp32_only_matrix_covers_measured_main_and_grouped_arms(cpu_model):
+    from benchmarks.ascend_main_prefix_linear import padded_fp32_linears
+
+    spec = matrix.FULL["c4_h2"]
+    inputs = matrix.combo.workload(spec, cpu_model.config.vocab_size)
+    with padded_fp32_linears(cpu_model, 256) as work:
+        for mode in matrix.MODES:
+            for arm in matrix.ARMS:
+                row = matrix.trial(cpu_model, spec, mode, arm, inputs, linear_work=work)
+                assert row["linear_work"]["installed"] == 16
+                assert set(row["linear_work"]["uncalled"]) <= {"model.early_exit_gate"}
+                assert row["hit_tokens"] == spec.starts(arm)
+
+
+def test_service_checks_the_requested_linear_precision_even_with_cache_off():
+    state = dict(
+        backend="ascend_eager",
+        packed=True,
+        dtype="torch.bfloat16",
+        prefix_enabled=False,
+        grouping_enabled=False,
+        prefix_hits=0,
+        prefix_queries=0,
+        live_blocks=0,
+    )
+    with pytest.raises(AssertionError, match="configuration"):
+        service.reconcile("off", [], [], [], dict(state=state, requests=[]), linear_fp32_chunk=256)
+    state.update(
+        linear_fp32_chunk=256, linear_work=dict(installed=2, executed=2, calls=4, uncalled=[])
+    )
+    assert (
+        service.reconcile("off", [], [], [], dict(state=state, requests=[]), linear_fp32_chunk=256)
+        == []
+    )
+    state["linear_work"].update(executed=1, uncalled=["lm_head"])
+    with pytest.raises(AssertionError, match="FP32 linears"):
+        service.reconcile("off", [], [], [], dict(state=state, requests=[]), linear_fp32_chunk=256)

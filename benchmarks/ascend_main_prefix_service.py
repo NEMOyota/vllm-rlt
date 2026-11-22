@@ -20,6 +20,7 @@ from uuid import uuid4
 import aiohttp
 
 from benchmarks.ascend_main_prefix_combo import BLOCK, SEED
+from benchmarks.ascend_main_prefix_linear import add_precision_arg, check_linear_usage
 from benchmarks.ascend_main_prefix_results import Report, ids_digest, quantiles, savings, write_csv
 from benchmarks.ascend_prefix_combo_checks import require
 from vllm_rlt.models import load_tokenizer
@@ -266,17 +267,21 @@ async def burst(client, url, model, plan, concurrency):
     return rows, wall
 
 
-def reconcile(mode, primers, plan, rows, audit):
+def reconcile(mode, primers, plan, rows, audit, *, linear_fp32_chunk=None):
     state = audit["state"]
     require(
         state.get("backend") == "ascend_eager"
         and state["packed"]
         and state["dtype"] == "torch.bfloat16"
         and state["prefix_enabled"] == (mode != "off")
-        and state["grouping_enabled"] == (mode == "grouped"),
+        and state["grouping_enabled"] == (mode == "grouped")
+        and state.get("linear_fp32_chunk") == linear_fp32_chunk,
         f"unexpected service configuration {state}",
     )
     issues = []
+    if linear_fp32_chunk is not None:
+        require("linear_work" in state, "missing FP32 worker execution counts")
+        check_linear_usage(state["linear_work"])
     observations = defaultdict(list)
     for obs in audit["requests"]:
         observations[obs["prompt_sha256"]].append(obs)
@@ -411,6 +416,7 @@ async def run_mode(args, report, mode, n, primers, plan, num_blocks, width):
         os.environ,
         RLT_BENCH_ATTENTION="grouped" if mode == "grouped" else "main",
         RLT_BENCH_AUDIT=str(audit.resolve()),
+        RLT_BENCH_LINEAR_FP32_CHUNK=str(args.linear_fp32_chunk) if args.linear_fp32_chunk else "",
     )
     async with aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=TIMEOUT),
@@ -425,7 +431,9 @@ async def run_mode(args, report, mode, n, primers, plan, num_blocks, width):
             rows, wall = await burst(client, url, model, plan, args.concurrency)
             report.record("HTTP_RESPONSES", mode=mode, round=n, requests=rows)
     captured = json.loads(audit.read_text())
-    issues = reconcile(mode, primers, plan, rows, captured)
+    issues = reconcile(
+        mode, primers, plan, rows, captured, linear_fp32_chunk=args.linear_fp32_chunk
+    )
     stats = summary(rows, wall)
     stats["group_calls"] = captured["state"]["group_calls"]
     report.record(
@@ -524,6 +532,7 @@ async def exercise(args, report):
             for cohort, m in {"all": s["overall"], **s["cohorts"]}.items():
                 csv_rows.append(
                     dict(
+                        **report.math,
                         round=i + 1,
                         mode=mode,
                         cohort=cohort,
@@ -577,6 +586,7 @@ def main(argv=None):
         help="Offered Poisson arrivals/s; 0 offers a burst with bounded client concurrency",
     )
     p.add_argument("--rounds", type=int, default=2)
+    add_precision_arg(p)
     p.add_argument("--seed", type=int, default=SEED)
     p.add_argument("--num-blocks", type=int, help="Override pool that otherwise fits all prompts")
     p.add_argument("--startup-timeout", type=float, default=240)
@@ -594,7 +604,7 @@ def main(argv=None):
         or (args.num_blocks is not None and args.num_blocks < 1)
     ):
         p.error("invalid local model, load or capacity arguments")
-    report = Report("SERVICE", args.out_dir)
+    report = Report("SERVICE", args.out_dir, linear_fp32_chunk=args.linear_fp32_chunk)
     return report.execute(args, lambda args, _device, report: asyncio.run(exercise(args, report)))
 
 

@@ -1,7 +1,8 @@
-"""Check synchronous native BF16 Ouro prefix reuse on the mainline Ascend execution path.
+"""Check synchronous Ouro prefix reuse on the mainline Ascend execution path.
 
 Run from the experiment worktree with one visible NPU:
     python -m benchmarks.ascend_main_prefix_combo --model /models/Ouro-1.4B
+    python -m benchmarks.ascend_main_prefix_combo --model /models/Ouro-1.4B --linear-fp32-chunk 256
 """
 
 import argparse
@@ -20,6 +21,13 @@ from pathlib import Path
 
 import torch
 
+from benchmarks.ascend_main_prefix_linear import (
+    add_precision_arg,
+    check_linear_usage,
+    linear_usage,
+    padded_fp32_linears,
+    precision_settings,
+)
 from benchmarks.ascend_prefix_combo_checks import PrefillAudit, page_oracle, require
 from benchmarks.preemption import checkpoint_identity
 from vllm_rlt import CacheConfig, ExecutionConfig, SamplingParams, SchedulerConfig
@@ -214,7 +222,13 @@ def run_arm(model, case, arm, primer, targets):
         check_pages(cache, starts, donor_prefix)
         path = audit.result()
         outputs = drain(engine, targets, OUTPUTS, first)
-        return dict(hit_tokens=origins, prefill_start=actual_starts, audit=path, requests=outputs)
+        return dict(
+            hit_tokens=origins,
+            prefill_start=actual_starts,
+            prefill_rows=batch.num_tokens,
+            audit=path,
+            requests=outputs,
+        )
     finally:
         engine.close()
 
@@ -276,11 +290,102 @@ def environment(device):
     )
 
 
+def run_model_cases(model, args, names, record, location, oracle_failed):
+    settings = precision_settings(args.linear_fp32_chunk)
+    parity_failed, controls_failed, repeat_drift = set(), set(), set()
+    location.update(phase="install_linears", **settings)
+    with padded_fp32_linears(model, args.linear_fp32_chunk) as work:
+        if work is not None:
+            installed, calls = work
+            record(
+                "COMBO_LINEAR",
+                modules=len(installed),
+                **settings,
+                has_exit_gate="model.early_exit_gate" in installed,
+                has_lm_head="lm_head" in installed,
+                output_dtype="bfloat16",
+            )
+            record("COMBO_LINEAR_MODULES", echo=False, names=installed)
+        for name in names:
+            case = CASES[name]
+            donor, miss, targets = prompts(case, model.config.vocab_size)
+            hashes = {
+                rid: hashlib.sha256(struct.pack(f"<{len(ids)}q", *ids)).hexdigest()
+                for rid, ids in targets.items()
+            }
+            record("COMBO_INPUTS", echo=False, case=name, prompt_sha256=hashes)
+            first = {}
+            for repeat in range(1, args.repeats + 1):
+                arms, controls, diffs = {}, {}, []
+                for arm in ARMS:
+                    location.update(phase="targets", case=name, repeat=repeat, arm=arm)
+                    fields = dict(**settings, case=name, repeat=repeat, arm=arm)
+                    try:
+                        if work is not None:
+                            calls.clear()
+                        result = run_arm(
+                            model, case, arm, miss if arm == "miss" else donor, targets
+                        )
+                        if work is not None:
+                            result["linear_work"] = linear_usage(work)
+                            check_linear_usage(result["linear_work"])
+                    except AssertionError as exc:
+                        controls[arm] = str(exc)
+                        record("COMBO_CONTROL", **fields, detail=str(exc))
+                        continue
+                    arms[arm] = result
+                    record("COMBO_ARM", echo=False, **fields, **result)
+                    if repeat == 1:
+                        first[arm] = result
+                    elif arm in first:
+                        changes = token_diffs(first[arm], result, f"{arm}_vs_repeat1")
+                        if changes:
+                            repeat_drift.add(name)
+                            diffs.extend(changes)
+                for arm in ("miss", "reuse"):
+                    if "off" in arms and arm in arms:
+                        changes = token_diffs(arms["off"], arms[arm], f"off_vs_{arm}")
+                        if changes:
+                            parity_failed.add(name)
+                            diffs.extend(changes)
+                if controls:
+                    controls_failed.add(name)
+                reuse = arms.get("reuse", {})
+                record(
+                    "COMBO_CASE",
+                    **settings,
+                    case=name,
+                    repeat=repeat,
+                    status="FAIL" if diffs or controls else "PASS",
+                    hit_tokens=reuse.get("hit_tokens"),
+                    audit=reuse.get("audit"),
+                    prefill_rows={a: r["prefill_rows"] for a, r in arms.items()},
+                    controls=controls,
+                    first_diffs=diffs,
+                )
+    failed = parity_failed | controls_failed | repeat_drift
+    if oracle_failed:
+        failed.add("page_oracle")
+    record(
+        "COMBO_REVIEW",
+        **settings,
+        status="FAIL" if failed else "PASS",
+        cases=names,
+        repeats=args.repeats,
+        failed=sorted(failed),
+        parity_failed=sorted(parity_failed),
+        controls_failed=sorted(controls_failed),
+        repeat_drift=sorted(repeat_drift),
+    )
+    return int(bool(failed))
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True, help="Local Ouro-1.4B checkpoint")
     parser.add_argument("--case", choices=CASES, action="append", help="Repeat to select cases")
     parser.add_argument("--repeats", type=int, default=2)
+    add_precision_arg(parser)
     parser.add_argument(
         "--out", type=Path, help="New JSONL file (default: results/main-prefix-combo-<UTC>.jsonl)"
     )
@@ -291,11 +396,13 @@ def main(argv=None):
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     path = args.out or Path("results") / f"main-prefix-combo-{stamp}.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
-    failed = set()
+    failed_so_far = set()
     with path.open("x", encoding="utf-8") as stream:
         print("RESULTS", path.resolve(), flush=True)
 
         def record(tag, *, echo=True, **data):
+            if data.get("status") == "FAIL" and tag in ("COMBO_CASE", "COMBO_ORACLE"):
+                failed_so_far.add(data.get("case", "page_oracle"))
             line = json.dumps(dict(kind=tag, **data), ensure_ascii=False)
             print(line, file=stream, flush=True)
             if echo:
@@ -305,7 +412,15 @@ def main(argv=None):
         try:
             device = resolve_device("npu:0")
             torch.npu.set_device(device)
-            record("COMBO_ENV", **environment(device), cases=names, repeats=args.repeats)
+            matmul = getattr(torch.npu, "matmul", None)
+            record(
+                "COMBO_ENV",
+                **environment(device),
+                cases=names,
+                repeats=args.repeats,
+                **precision_settings(args.linear_fp32_chunk),
+                native_allow_hf32=getattr(matmul, "allow_hf32", None),
+            )
             location = dict(phase="page_oracle")
             attention = create_backend(
                 "ascend_eager", device, torch.bfloat16, 64, BLOCK, prefer_packed_prefill=True
@@ -322,11 +437,12 @@ def main(argv=None):
                 attention=attention,
                 enable_prefix_caching=True,
             )
+            oracle_failed = False
             try:
                 page_oracle(probe)
                 record("COMBO_ORACLE", status="PASS", layers=2, depths=4)
             except AssertionError as exc:
-                failed.add("page_oracle")
+                oracle_failed = True
                 record("COMBO_ORACLE", status="FAIL", detail=str(exc))
             del probe
             location = dict(phase="checkpoint")
@@ -334,66 +450,18 @@ def main(argv=None):
             model = OuroForCausalLM.from_pretrained(
                 args.model, device=device, dtype=torch.bfloat16
             ).eval()
-            for name in names:
-                case = CASES[name]
-                donor, miss, targets = prompts(case, model.config.vocab_size)
-                hashes = {
-                    rid: hashlib.sha256(struct.pack(f"<{len(ids)}q", *ids)).hexdigest()
-                    for rid, ids in targets.items()
-                }
-                record("COMBO_INPUTS", echo=False, case=name, prompt_sha256=hashes)
-                original = {}
-                for repeat in range(1, args.repeats + 1):
-                    arms = {}
-                    diffs = []
-                    controls = {}
-                    for arm in ARMS:
-                        location = dict(phase="targets", case=name, repeat=repeat, arm=arm)
-                        try:
-                            result = run_arm(
-                                model, case, arm, miss if arm == "miss" else donor, targets
-                            )
-                        except AssertionError as exc:
-                            controls[arm] = str(exc)
-                            record(
-                                "COMBO_CONTROL", case=name, repeat=repeat, arm=arm, detail=str(exc)
-                            )
-                            continue
-                        arms[arm] = result
-                        record("COMBO_ARM", echo=False, case=name, repeat=repeat, arm=arm, **result)
-                        if repeat == 1:
-                            original[arm] = result
-                        elif arm in original:
-                            diffs.extend(token_diffs(original[arm], result, f"{arm}_vs_repeat1"))
-                    for arm in ("miss", "reuse"):
-                        if "off" in arms and arm in arms:
-                            diffs.extend(token_diffs(arms["off"], arms[arm], f"off_vs_{arm}"))
-                    if diffs or controls:
-                        failed.add(name)
-                    reuse = arms.get("reuse", {})
-                    record(
-                        "COMBO_CASE",
-                        status="FAIL" if diffs or controls else "PASS",
-                        case=name,
-                        repeat=repeat,
-                        hit_tokens=reuse.get("hit_tokens"),
-                        audit=reuse.get("audit"),
-                        controls=controls,
-                        first_diffs=diffs,
-                    )
+            return run_model_cases(model, args, names, record, location, oracle_failed)
         except Exception as exc:
             record("COMBO_ERROR", **location, error=type(exc).__name__, detail=str(exc))
-            record("COMBO_REVIEW", status="INCOMPLETE", stopped_at=location, failed=sorted(failed))
+            record(
+                "COMBO_REVIEW",
+                status="INCOMPLETE",
+                stopped_at=location,
+                **precision_settings(args.linear_fp32_chunk),
+                failed=sorted(failed_so_far),
+            )
             traceback.print_exc()
             return 2
-        record(
-            "COMBO_REVIEW",
-            status="FAIL" if failed else "PASS",
-            cases=names,
-            repeats=args.repeats,
-            failed=sorted(failed),
-        )
-    return int(bool(failed))
 
 
 if __name__ == "__main__":

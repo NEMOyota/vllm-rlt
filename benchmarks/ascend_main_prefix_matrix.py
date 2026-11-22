@@ -1,4 +1,4 @@
-"""Full native BF16 parity and paired mainline prefix/grouping benefits on Ascend."""
+"""Full parity and paired mainline prefix/grouping benefits at a single linear precision."""
 
 import argparse
 import gc
@@ -12,6 +12,12 @@ import torch
 from benchmarks import ascend_main_prefix_combo as combo
 from benchmarks.ascend_main_prefix_combo import ARMS, BLOCK, OUTPUTS, Case
 from benchmarks.ascend_main_prefix_grouping import attention_mode, group_counts
+from benchmarks.ascend_main_prefix_linear import (
+    add_precision_arg,
+    check_linear_usage,
+    linear_usage,
+    padded_fp32_linears,
+)
 from benchmarks.ascend_main_prefix_results import Report, ids_digest, quantiles, savings, write_csv
 from benchmarks.ascend_prefix_combo_checks import require
 from vllm_rlt import SamplingParams
@@ -61,7 +67,7 @@ def trial_order(round_index):
 
 
 @torch.inference_mode()
-def trial(model, case, mode, arm, inputs):
+def trial(model, case, mode, arm, inputs, *, linear_work=None):
     donor, miss, targets, fillers = inputs
     gc.collect()
     with attention_mode(mode):
@@ -102,6 +108,8 @@ def trial(model, case, mode, arm, inputs):
         prefix_hits, queries = cache.prefix_hits, cache.prefix_queries
         kernel = cache.attention.kernel
         groups_before = group_counts(kernel)
+        if linear_work is not None:
+            linear_work[1].clear()
         submitted, first, finished = {}, {}, {}
         tick = time.perf_counter
         for rid, tokens in targets.items():
@@ -162,6 +170,10 @@ def trial(model, case, mode, arm, inputs):
                 e2e_ms=1000 * (t - submitted[rid]),
                 hit_tokens=origins[rid],
             )
+        work_stats = {}
+        if linear_work is not None:
+            work_stats["linear_work"] = linear_usage(linear_work)
+            check_linear_usage(work_stats["linear_work"])
         return dict(
             requests=rows,
             wall_ms=1000 * (end - min(submitted.values())),
@@ -169,6 +181,7 @@ def trial(model, case, mode, arm, inputs):
             hit_tokens=origins,
             group_calls=counts,
             num_blocks=cache.num_blocks,
+            **work_stats,
         )
     finally:
         engine.close()
@@ -203,7 +216,7 @@ def comparisons(rounds):
     return {name: savings(timings(a), timings(b)) for name, a, b in pairs}
 
 
-def run_cases(args, model, report, names):
+def run_cases(args, model, report, names, *, linear_work=None):
     failed, csv_rows = [], []
     failed_comparisons = {}
     benefit_by_case = {}
@@ -225,7 +238,7 @@ def run_cases(args, model, report, names):
                 loc = dict(case=name, round=i + 1, warmup=i < 0, mode=mode, arm=arm)
                 report.location = loc
                 try:
-                    result = trial(model, case, mode, arm, inputs)
+                    result = trial(model, case, mode, arm, inputs, linear_work=linear_work)
                 except AssertionError as e:
                     issues.append(dict(**loc, control=str(e)))
                     report.record("CONTROL", echo=True, **issues[-1])
@@ -292,6 +305,7 @@ def run_cases(args, model, report, names):
                 csv_rows.append(
                     dict(
                         case=name,
+                        **report.math,
                         status=summary["status"],
                         mode=mode,
                         arm=arm,
@@ -322,7 +336,7 @@ def run_cases(args, model, report, names):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("experiment", choices=("bf16", "benefit"))
+    p.add_argument("experiment", choices=("bf16", "fp32", "benefit"))
     p.add_argument("--model", required=True, type=Path)
     group = p.add_mutually_exclusive_group()
     group.add_argument("--case", choices=FULL, action="append")
@@ -331,26 +345,31 @@ def main(argv=None):
     )
     p.add_argument("--warmups", type=int)
     p.add_argument("--repeats", type=int)
+    add_precision_arg(p)
     p.add_argument("--out-dir", type=Path, help="New output directory")
     args = p.parse_args(argv)
+    correctness = args.experiment != "benefit"
+    if args.experiment == "fp32" and args.linear_fp32_chunk is None:
+        args.linear_fp32_chunk = 256
     if args.repeats is None:
-        args.repeats = 3 if args.experiment == "bf16" else 6
+        args.repeats = 3 if correctness else 6
     if args.warmups is None:
-        args.warmups = 0 if args.experiment == "bf16" else 1
+        args.warmups = 0 if correctness else 1
     if args.repeats < 1 or args.warmups < 0 or not args.model.is_dir():
         p.error("provide a local model, positive repeats and nonnegative warmups")
-    names = list(
-        dict.fromkeys(
-            args.case or (FULL if args.experiment == "bf16" or args.all_cases else BENEFIT)
-        )
-    )
-    report = Report(args.experiment.upper(), args.out_dir)
+    names = list(dict.fromkeys(args.case or (FULL if correctness or args.all_cases else BENEFIT)))
+    kind = ("FP32" if args.linear_fp32_chunk is not None else "BF16") if correctness else "BENEFIT"
+    report = Report(kind, args.out_dir, linear_fp32_chunk=args.linear_fp32_chunk)
 
     def run(args, device, report):
         model = OuroForCausalLM.from_pretrained(
             args.model, device=device, dtype=torch.bfloat16
         ).eval()
-        return run_cases(args, model, report, names)
+        report.location = {"phase": "install_linears"}
+        with padded_fp32_linears(model, args.linear_fp32_chunk) as work:
+            if work is not None:
+                report.record("LINEAR_MODULES", modules=work[0])
+            return run_cases(args, model, report, names, linear_work=work)
 
     return report.execute(args, run)
 
