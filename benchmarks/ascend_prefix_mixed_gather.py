@@ -231,13 +231,17 @@ class Pairs:
     profile_pair = None
     stock_methods = ("attend_metadata", "_forward")
 
-    def __init__(self, run_trial, stream, reference, *, repeats=3, trace_dir=None):
+    def __init__(
+        self, run_trial, stream, reference, *, repeats=3, trace_dir=None, case_name=None, modes=None
+    ):
         self.run_trial = run_trial
         self.stream = stream
         self.reference = reference
         self.runs = []
         self.counts = Counter()
-        self.modes = ("original", *self.intermediate_modes, self.candidate)
+        self.case_name = case_name or self.case_name
+        self.modes = modes or ("original", *self.intermediate_modes, self.candidate)
+        self.candidate = self.modes[-1]
         self.audits = {mode: {} for mode in self.modes}
         self.repeats = repeats
         self.trace_dir = trace_dir
@@ -373,16 +377,16 @@ def reference_settings(path, case_name="c4_h1"):
     return rows, case["trials"][0]["off"]
 
 
-def main(argv=None, *, pair_type=Pairs, description=__doc__):
-    tag = pair_type.label.lower()
-    case_name = pair_type.case_name
+def argument_parser(pair_type, description, *, reference_required=False):
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--model", required=True, type=Path)
-    parser.add_argument("--reference", type=Path, help="accepted full FP32 matrix JSON")
+    parser.add_argument(
+        "--reference", type=Path, required=reference_required, help="accepted full FP32 matrix JSON"
+    )
     parser.add_argument("--chunk-rows", type=int, help="same value as the accepted FP32 run")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument(
-        "--out-dir", type=Path, help=f"new directory (default: results/{tag}-{case_name}-UTC)"
+        "--out-dir", type=Path, help="new directory (default: results/<experiment>-<case>-UTC)"
     )
     if pair_type.profile_pair is not None:
         parser.add_argument(
@@ -390,7 +394,17 @@ def main(argv=None, *, pair_type=Pairs, description=__doc__):
             action="store_true",
             help="after passing timing gates, trace one fresh reuse burst per variant",
         )
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv=None, *, pair_type=Pairs, description=__doc__):
+    parser = argument_parser(pair_type, description)
+    return run_experiment(parser, parser.parse_args(argv), pair_type)
+
+
+def run_experiment(parser, args, pair_type, *, case_name=None, modes=None):
+    tag = pair_type.label.lower()
+    case_name = case_name or pair_type.case_name
     saved_rows, reference = reference_settings(args.reference, case_name)
     rows = args.chunk_rows if args.chunk_rows is not None else saved_rows
     if rows is None or rows < 1:
@@ -411,6 +425,8 @@ def main(argv=None, *, pair_type=Pairs, description=__doc__):
             stream,
             reference,
             repeats=args.repeats,
+            case_name=case_name,
+            modes=modes,
             trace_dir=out / "traces" if getattr(args, "trace_reuse", False) else None,
         )
         pairs.record(

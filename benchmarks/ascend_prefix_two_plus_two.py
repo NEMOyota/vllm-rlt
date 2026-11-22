@@ -16,37 +16,45 @@ else:  # Allow running from an archive next to the server's local FP32 matrix.
 paired = mixed.paired
 
 
-@dataclass
-class SuffixPair(mixed.ColdBatch):
-    """Cache indices and absolute masks for this metadata, never K/V from another layer."""
+def equal_suffixes(batch, groups):
+    """All queries must cover the same contiguous absolute positions at one loop depth."""
+    _, depth, start = batch.rows[groups[0][0]]
+    width = groups[0][1].numel()
+    if start <= 0 or width < 2:
+        return False
+    expected = list(range(start, start + width))
+    for row, indices, positions, _, initial, _ in groups:
+        alloc, group_depth, group_start = batch.rows[row]
+        if (
+            initial
+            or group_depth != depth
+            or group_start != start
+            or indices.numel() != width
+            or positions.numel() != start + width
+        ):
+            return False
+        if [p for a, d, p in batch.rows if a is alloc and d == depth] != expected:
+            return False
+    return True
 
-    suffix_indices: torch.Tensor | None = None
+
+@dataclass
+class SuffixBatch:
+    """Only indices and masks survive between layers sharing the current metadata."""
+
+    hot_groups: list
+    suffix_indices: torch.Tensor
+    masks: torch.Tensor
     read_slots: torch.Tensor | None = None
-    masks: torch.Tensor | None = None
 
     @classmethod
-    def plan(cls, batch, groups, cold_count=2):
-        plan = super().plan(batch, groups, cold_count)
-        if plan is None:
-            return None
-        first, second = plan.hot_groups
-        # Each mask in _plan uses the original context lengths. Require a contiguous
-        # suffix at the same absolute positions in both requests before batching.
-        for group in (first, second):
-            row, indices, positions, *_ = group
-            alloc, depth, start = batch.rows[row]
-            if positions.numel() != start + indices.numel():
-                return None
-            query_positions = [p for a, d, p in batch.rows if a is alloc and d == depth]
-            if query_positions != list(range(start, positions.numel())):
-                return None
-        if (first[1].numel(), first[2].numel()) != (second[1].numel(), second[2].numel()):
-            return None
-        plan.suffix_indices = torch.cat([g[1] for g in plan.hot_groups])
-        plan.masks = torch.stack([g[3] for g in plan.hot_groups])[:, None]
-        return plan
+    def from_groups(cls, groups):
+        return cls(
+            groups, torch.cat([g[1] for g in groups]), torch.stack([g[3] for g in groups])[:, None]
+        )
 
-    def suffixes(self, native, owner, q, keys, values, tables, flat_rows, result):
+    def attend(self, q, keys, tables, flat_rows, result):
+        size = len(self.hot_groups)
         flat_keys, flat_values, rows_per_block = flat_rows
         block_size, kv_heads, head_dim = keys.shape[-3:]
         context = self.hot_groups[0][2].numel()
@@ -63,13 +71,13 @@ class SuffixPair(mixed.ColdBatch):
             )
 
         def gather(flat):
-            rows = flat.index_select(0, self.read_slots).reshape(2, context, kv_heads, head_dim)
+            rows = flat.index_select(0, self.read_slots).reshape(size, context, kv_heads, head_dim)
             heads = rows.transpose(1, 2)
             if q.shape[1] != kv_heads:
                 heads = heads.repeat_interleave(q.shape[1] // kv_heads, dim=1)
             return heads.contiguous()
 
-        query = q.index_select(0, self.suffix_indices).reshape(2, width, q.shape[1], head_dim)
+        query = q.index_select(0, self.suffix_indices).reshape(size, width, q.shape[1], head_dim)
         query = query.transpose(1, 2).contiguous()
         key, value = gather(flat_keys), gather(flat_values)
         scores = torch.matmul(query, key.transpose(-2, -1)) * (1.0 / math.sqrt(head_dim))
@@ -79,6 +87,22 @@ class SuffixPair(mixed.ColdBatch):
             result = torch.zeros_like(q)
         result.index_copy_(0, self.suffix_indices, output)
         return result
+
+
+@dataclass
+class SuffixPair(mixed.ColdBatch):
+    suffix_batch: SuffixBatch | None = None
+
+    @classmethod
+    def plan(cls, batch, groups, cold_count=2):
+        plan = super().plan(batch, groups, cold_count)
+        if plan is None or not equal_suffixes(batch, plan.hot_groups):
+            return None
+        plan.suffix_batch = SuffixBatch.from_groups(plan.hot_groups)
+        return plan
+
+    def suffixes(self, native, owner, q, keys, values, tables, flat_rows, result):
+        return self.suffix_batch.attend(q, keys, tables, flat_rows, result)
 
 
 class TwoPlusTwo(mixed.ThreePlusOne):
@@ -93,7 +117,10 @@ class TwoPlusTwo(mixed.ThreePlusOne):
     def variant_route(self, mode, audit):
         plan = SuffixPair.plan if mode == self.batched_suffix_mode else mixed.ColdBatch.plan
         return mixed.route(
-            mode != "original", audit, cold_count=2, plan_batch=partial(plan, cold_count=2)
+            mode != "original",
+            audit,
+            cold_count=self.cold_count,
+            plan_batch=partial(plan, cold_count=self.cold_count),
         )
 
     def timing_summary(self):

@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 import torch
 
-from benchmarks.ascend_prefix_scenarios import _mismatches
+from benchmarks.ascend_prefix_scenarios import _mismatches, suites
 from benchmarks.ascend_prefix_trace import npu_profiler, trace_target
 from vllm_rlt.kernels.ascend_eager import AscendEagerAttention, _prefill_geometry
 from vllm_rlt.request import RequestPhase
@@ -42,7 +42,8 @@ class ColdBatch:
         cold = [g for g in groups if g[4]]  # _plan already verified positions 0..width-1.
         hot = [g for g in groups if not g[4]]
         if (
-            len(cold) != cold_count
+            not cold
+            or len(cold) != cold_count
             or len(hot) != 4 - cold_count
             or any(g[1].numel() <= 1 for g in hot)
         ):
@@ -87,13 +88,13 @@ class ColdBatch:
         return result
 
 
-def split_forward(native, audit, plan_batch=ColdBatch.plan):
+def split_forward(native, audit, plan_batch=ColdBatch.plan, batch_size=4):
     last_batch = last_layout = plan = None
 
     def forward(owner, q, keys, values, tables, groups, *, flat_rows=None, result=None):
         nonlocal last_batch, last_layout, plan
         batch = owner._metadata() if owner._metadata is not None else None
-        if batch is not None and flat_rows is not None and len(groups) == 4:
+        if batch is not None and flat_rows is not None and len(groups) == batch_size:
             layout = (flat_rows[2], flat_rows[0].shape[0], q.dtype, q.device)
             if batch is not last_batch or layout != last_layout:
                 plan = plan_batch(batch, groups)
@@ -134,7 +135,7 @@ def count_attention_calls(audit):
 
 
 @contextmanager
-def route(enabled, audit, *, cold_count=3, plan_batch=ColdBatch.plan):
+def route(enabled, audit, *, cold_count=3, plan_batch=ColdBatch.plan, batch_size=4):
     if not enabled and audit is None:
         yield
         return
@@ -152,7 +153,7 @@ def route(enabled, audit, *, cold_count=3, plan_batch=ColdBatch.plan):
                 [[s.request.request_id, s.token_start, s.token_count] for s in spans]
             )
         mixed = (
-            len(spans) == 4
+            len(spans) == batch_size
             and sum(s.token_start == 0 for s in spans) == cold_count
             and all(
                 s.token_start == s.request.prefill_window_origin
@@ -169,7 +170,7 @@ def route(enabled, audit, *, cold_count=3, plan_batch=ColdBatch.plan):
                     patch.object(
                         AscendEagerAttention,
                         "_forward",
-                        split_forward(AscendEagerAttention._forward, audit, plan_batch),
+                        split_forward(AscendEagerAttention._forward, audit, plan_batch, batch_size),
                     )
                 )
             return execute(runner, schedule, prepared)
@@ -216,26 +217,33 @@ class ThreePlusOne(paired.Pairs):
             steps=Counter(), prefill_spans=[], split_calls=0, matmul=0, softmax_b_q_k=Counter()
         )
 
-    @classmethod
-    def audit_issues(cls, audits, calls):
+    def suffix_width(self, mode, hits):
+        return hits if mode == self.batched_suffix_mode else 1
+
+    def audit_issues(self, audits, calls):
+        case = next(c for c in suites()["full"] if c.name == self.case_name)
+        size = case.concurrency
+        total = case.prefix + case.suffix
         issues = []
         for mode, arms in audits.items():
             for arm, audit in arms.items():
-                split = arm == "reuse" and mode != "original"
-                shapes = {"4x144x144": calls}
-                if arm == "reuse":
-                    hot = 4 - cls.cold_count
-                    cold_batch = cls.cold_count if split else 1
-                    hot_batch = hot if mode == cls.batched_suffix_mode else 1
-                    shapes = {
-                        f"{cold_batch}x144x144": calls * (cls.cold_count // cold_batch),
-                        f"{hot_batch}x16x144": calls * (hot // hot_batch),
-                    }
+                hits = case.hits if arm == "reuse" else 0
+                cold = size - hits
+                shapes = {f"{size}x{total}x{total}": calls}
+                split = False
+                if hits:
+                    hot_width = self.suffix_width(mode, hits)
+                    shapes = {f"{hot_width}x{case.suffix}x{total}": calls * (hits // hot_width)}
+                    split = hot_width > 1
+                    if cold:
+                        cold_width = cold if mode != "original" else 1
+                        shapes[f"{cold_width}x{total}x{total}"] = calls * (cold // cold_width)
+                        split = split or cold_width > 1
                 spans = [
-                    [f"target-{i}", 128, 16]
-                    if i < 4 - cls.cold_count and arm == "reuse"
-                    else [f"target-{i}", 0, 144]
-                    for i in range(4)
+                    [f"target-{i}", case.prefix, case.suffix]
+                    if i < hits
+                    else [f"target-{i}", 0, total]
+                    for i in range(size)
                 ]
                 checks = {
                     "softmax_b_q_k": (dict(audit["softmax_b_q_k"]), shapes),
