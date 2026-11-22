@@ -42,11 +42,13 @@ class Case:
     suffix: int
     count: int = 1
     hot: int = 1
+    tight_pool: bool = False
+    churn: int = 0
 
     def starts(self, arm):
         reusable = min(self.prefix, self.prefix + self.suffix - 1) // BLOCK * BLOCK
         return {
-            f"target-{i}": reusable if arm == "reuse" and i < self.hot else 0
+            f"target-{i}": reusable if arm == "reuse" and i < self.hot and not self.churn else 0
             for i in range(self.count)
         }
 
@@ -64,7 +66,7 @@ CASES = {
 }
 
 
-def prompts(case, vocab):
+def workload(case, vocab):
     """Keep the seed-168 targets and donor mutations of ascend_prefix_workload._prompts."""
     rng = random.Random(SEED)
     target = rng.choices(range(vocab), k=case.prefix + case.suffix)
@@ -77,7 +79,7 @@ def prompts(case, vocab):
     if case.suffix:
         reserved.update((target[case.prefix], donor[case.prefix]))
     candidates = rng.sample(range(vocab), case.count + len(reserved))
-    markers = [t for t in candidates if t not in reserved]
+    markers = [t for t in candidates if t not in reserved][: case.count]
     targets = {}
     for i in range(case.count):
         tokens = target.copy()
@@ -87,12 +89,26 @@ def prompts(case, vocab):
         if i >= case.hot:
             tokens[0] = markers[i]
         targets[f"target-{i}"] = tokens
+    fillers = []
+    if case.churn:
+        reserved.update(markers)
+        count = case.count * case.churn
+        candidates = rng.sample(range(vocab), count + len(reserved))
+        for marker in [t for t in candidates if t not in reserved][:count]:
+            tokens = rng.choices(range(vocab), k=len(donor) + OUTPUTS - 1)
+            tokens[0] = marker
+            fillers.append(tokens)
+    return donor, miss, targets, fillers
+
+
+def prompts(case, vocab):
+    donor, miss, targets, _ = workload(case, vocab)
     return donor, miss, targets
 
 
 def open_engine(model, case, arm):
     capacity = case.prefix + case.suffix + OUTPUTS - 1
-    blocks = 4 * math.ceil(capacity / BLOCK) * (case.count + 1)
+    blocks = 4 * math.ceil(capacity / BLOCK) * (case.count if case.tight_pool else case.count + 1)
     return StageEngine(
         model,
         attention_backend="ascend_eager",
