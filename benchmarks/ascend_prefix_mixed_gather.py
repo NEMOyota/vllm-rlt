@@ -186,29 +186,32 @@ def token_diffs(reference, actual):
         return [dict(error=str(exc))]
 
 
-def ttft_review(measured):
+def paired_ms(original, changed, candidate):
+    saved = [a - b for a, b in zip(original, changed, strict=True)]
+    return {
+        "original_ms": round(median(original), 2),
+        f"{candidate}_ms": round(median(changed), 2),
+        "paired_saved_ms": [round(x, 2) for x in saved],
+        "median_paired_saved_ms": round(median(saved), 2),
+    }
+
+
+def ttft_review(measured, candidate="merged"):
     # Four requests in one burst are correlated. Pair variants within each repeat.
     times = {
         arm: {
             mode: [median(r["ttft_ms"] for r in pair[mode][arm]["requests"]) for pair in measured]
-            for mode in ("original", "merged")
+            for mode in ("original", candidate)
         }
         for arm in ARMS
     }
     times["reuse_minus_miss"] = {
         mode: [r - m for r, m in zip(times["reuse"][mode], times["miss"][mode], strict=True)]
-        for mode in ("original", "merged")
+        for mode in ("original", candidate)
     }
-    result = {}
-    for arm, p50 in times.items():
-        saved = [a - b for a, b in zip(p50["original"], p50["merged"], strict=True)]
-        result[arm] = dict(
-            original_ms=round(median(p50["original"]), 2),
-            merged_ms=round(median(p50["merged"]), 2),
-            paired_saved_ms=[round(x, 2) for x in saved],
-            median_paired_saved_ms=round(median(saved), 2),
-        )
-    return result
+    return {
+        arm: paired_ms(p50["original"], p50[candidate], candidate) for arm, p50 in times.items()
+    }
 
 
 class GateFailure(RuntimeError):
@@ -216,21 +219,48 @@ class GateFailure(RuntimeError):
 
 
 class Pairs:
-    def __init__(self, run_trial, stream, reference):
+    label = "GATHER"
+    candidate = "merged"
+    audit_scope = "target mixed-prefill flat K/V Tensor.index_select calls"
+    route = staticmethod(route)
+    new_audit = staticmethod(new_audit)
+    audit_issues = staticmethod(audit_issues)
+    profile_pair = None
+    stock_methods = ("attend_metadata", "_forward")
+
+    def __init__(self, run_trial, stream, reference, *, repeats=3, trace_dir=None):
         self.run_trial = run_trial
         self.stream = stream
         self.reference = reference
         self.runs = []
         self.counts = Counter()
-        self.audits = {"original": {}, "merged": {}}
+        self.audits = {"original": {}, self.candidate: {}}
+        self.repeats = repeats
+        self.trace_dir = trace_dir
+        self.traces = {}
 
     def record(self, kind, **fields):
         print(json.dumps(dict(kind=kind, **fields), allow_nan=False), file=self.stream, flush=True)
 
+    def run_variant(self, mode, audit, trial_args, trial_kwargs, profile_target=None):
+        burst = workload._target_burst
+
+        def target(engine, targets, params, expected):
+            profile = profile_target(engine, targets) if profile_target else nullcontext()
+            with profile, self.route(mode == self.candidate, audit):
+                return burst(engine, targets, params, expected)
+
+        with patch.object(workload, "_target_burst", target):
+            return self.run_trial(*trial_args, **trial_kwargs)
+
+    def timing_summary(self):
+        return dict(ttft=ttft_review(self.runs[1:], self.candidate))
+
     def __call__(self, model, backend, case, arm, output_tokens, seed, *extra, **kwargs):
         if not self.runs:
             source = Path(ascend_eager.__file__).resolve()
-            for method in (AscendEagerAttention.attend_metadata, AscendEagerAttention._forward):
+            for name in self.stock_methods:
+                method = getattr(AscendEagerAttention, name)
                 if Path(method.__code__.co_filename).resolve() != source:
                     raise RuntimeError(f"disable the other attention hook before A/B: {method}")
             self.record(
@@ -244,23 +274,16 @@ class Pairs:
         repeat = self.counts[arm]
         self.counts[arm] += 1
         if repeat == len(self.runs):
-            self.runs.append({"original": {}, "merged": {}})
+            self.runs.append({"original": {}, self.candidate: {}})
         pair = self.runs[repeat]
-        order = ["original", "merged"]
+        order = ["original", self.candidate]
         if (repeat + ARMS.index(arm)) % 2:
             order.reverse()
         for mode in order:
-            audit = new_audit() if repeat == 0 else None
-            burst = workload._target_burst
-
-            def target(*args, **kw):
-                with route(mode == "merged", audit):
-                    return burst(*args, **kw)
-
-            with patch.object(workload, "_target_burst", target):
-                trial = self.run_trial(
-                    model, backend, case, arm, output_tokens, seed, *extra, **kwargs
-                )
+            audit = self.new_audit() if repeat == 0 else None
+            trial = self.run_variant(
+                mode, audit, (model, backend, case, arm, output_tokens, seed, *extra), kwargs
+            )
             pair[mode][arm] = trial
             if audit is not None:
                 self.audits[mode][arm] = audit
@@ -279,7 +302,7 @@ class Pairs:
                 prefix_queries=trial["prefix_queries"],
             )
 
-        if len(pair["merged"]) == len(ARMS):
+        if len(pair[self.candidate]) == len(ARMS):
             issues = []
             if self.reference is None:
                 self.reference = pair["original"]["off"]
@@ -289,20 +312,29 @@ class Pairs:
                     for diff in token_diffs(self.reference, arms[a]):
                         issues.append(dict(mode=mode, arm=a, check="vs_reference_off", **diff))
             for a in ARMS:
-                for diff in token_diffs(pair["original"][a], pair["merged"][a]):
-                    issues.append(dict(arm=a, check="original_vs_merged", **diff))
+                for diff in token_diffs(pair["original"][a], pair[self.candidate][a]):
+                    issues.append(dict(arm=a, check=f"original_vs_{self.candidate}", **diff))
             if repeat == 0:
                 calls = model.config.num_hidden_layers * model.config.total_ut_steps
-                issues.extend(audit_issues(self.audits, calls))
-                print("GATHER_AUDIT", json.dumps(self.audits), flush=True)
+                issues.extend(self.audit_issues(self.audits, calls))
+                print(f"{self.label}_AUDIT", json.dumps(self.audits), flush=True)
             self.record("gate", repeat=repeat, passed=not issues, issues=issues)
             print(
-                "GATHER_GATE",
+                f"{self.label}_GATE",
                 json.dumps(dict(repeat=repeat, passed=not issues, issues=issues)),
                 flush=True,
             )
             if issues:
-                raise GateFailure(f"c4_h1 gate failed on repeat {repeat}; see GATHER_GATE")
+                raise GateFailure(f"c4_h1 gate failed on repeat {repeat}; see {self.label}_GATE")
+            if self.trace_dir is not None and repeat == self.repeats:
+                # The server's all-Linear patch is still active here. Keep trace replays
+                # out of timing samples and retain the measurements if trace export fails.
+                timing = self.timing_summary()
+                self.record("timing", measured_pairs=repeat, **timing)
+                print(f"{self.label}_TIMING", json.dumps(timing), flush=True)
+                self.traces = self.profile_pair(
+                    (model, backend, case, "reuse", output_tokens, seed, *extra), kwargs
+                )
         return pair["original"][arm]
 
 
@@ -332,15 +364,22 @@ def reference_settings(path):
     return rows, case["trials"][0]["off"]
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
+def main(argv=None, *, pair_type=Pairs, description=__doc__):
+    tag = pair_type.label.lower()
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--model", required=True, type=Path)
     parser.add_argument("--reference", type=Path, help="accepted full FP32 matrix JSON")
     parser.add_argument("--chunk-rows", type=int, help="same value as the accepted FP32 run")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument(
-        "--out-dir", type=Path, help="new directory (default: results/gather-c4_h1-UTC)"
+        "--out-dir", type=Path, help=f"new directory (default: results/{tag}-c4_h1-UTC)"
     )
+    if pair_type.profile_pair is not None:
+        parser.add_argument(
+            "--trace-reuse",
+            action="store_true",
+            help="after passing timing gates, trace one fresh reuse burst per variant",
+        )
     args = parser.parse_args(argv)
     saved_rows, reference = reference_settings(args.reference)
     rows = args.chunk_rows if args.chunk_rows is not None else saved_rows
@@ -351,13 +390,19 @@ def main(argv=None):
     if not args.model.is_dir() or args.repeats < 1:
         parser.error("provide a local model directory and at least one measured repeat")
     out = args.out_dir or Path("results") / datetime.now(timezone.utc).strftime(
-        "gather-c4_h1-%Y%m%dT%H%M%S%fZ"
+        f"{tag}-c4_h1-%Y%m%dT%H%M%S%fZ"
     )
     out.mkdir(parents=True, exist_ok=False)
-    report = out / "gather.jsonl"
+    report = out / f"{tag}.jsonl"
     print("RESULTS", report.resolve(), flush=True)
     with report.open("x", encoding="utf-8") as stream:
-        pairs = Pairs(matrix.run_trial, stream, reference)
+        pairs = pair_type(
+            matrix.run_trial,
+            stream,
+            reference,
+            repeats=args.repeats,
+            trace_dir=out / "traces" if getattr(args, "trace_reuse", False) else None,
+        )
         pairs.record(
             "config",
             case="c4_h1",
@@ -366,8 +411,9 @@ def main(argv=None):
             repeats=args.repeats,
             seed=168,
             output_tokens=16,
-            audit_scope="target mixed-prefill flat K/V Tensor.index_select calls",
-            ttft_definition="per-burst median in ms, paired_saved_ms = original - merged",
+            candidate=pairs.candidate,
+            audit_scope=pairs.audit_scope,
+            ttft_definition=f"burst median (ms), paired_saved_ms = original - {pairs.candidate}",
             reference=str(args.reference) if args.reference else "live original/off",
         )
         try:
@@ -402,8 +448,10 @@ def main(argv=None):
                 status="PASS",
                 case="c4_h1",
                 measured_pairs=args.repeats,
-                ttft=ttft_review(pairs.runs[1:]),
+                **pairs.timing_summary(),
             )
+            if pairs.traces:
+                review["reuse_traces"] = pairs.traces
         except (Exception, SystemExit, KeyboardInterrupt) as exc:
             review = dict(
                 status="FAIL" if isinstance(exc, GateFailure) else "ERROR", error=repr(exc)
@@ -411,10 +459,10 @@ def main(argv=None):
             if isinstance(exc, SystemExit):
                 review["matrix_cli"] = "Use the server checkout providing --linear-fp32-chunk."
             pairs.record("review", **review)
-            print("GATHER_REVIEW", json.dumps(review), flush=True)
+            print(f"{pairs.label}_REVIEW", json.dumps(review), flush=True)
             raise
         pairs.record("review", **review)
-        print("GATHER_REVIEW", json.dumps(review), flush=True)
+        print(f"{pairs.label}_REVIEW", json.dumps(review), flush=True)
 
 
 if __name__ == "__main__":
