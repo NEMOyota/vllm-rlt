@@ -25,6 +25,11 @@ def add_runtime_args(parser):
         action="store_true",
         help="Batch equal-length cold prompts in mixed ascend_eager prefills",
     )
+    parser.add_argument(
+        "--ascend-batch-cached-suffix",
+        action="store_true",
+        help="Batch compatible cached prompt suffixes in ordinary ascend_eager prefill",
+    )
     parser.add_argument("--incremental-kv", action="store_true")
     parser.add_argument("--kv-watermark", type=float, default=0.0)
     parser.add_argument("--scheduling-policy", choices=["fcfs", "priority"], default="fcfs")
@@ -125,6 +130,7 @@ def runtime_configs(args):
         execution_config=ExecutionConfig(
             prefill_uva=args.prefill_uva,
             ascend_batch_cold_prefill=args.ascend_batch_cold_prefill,
+            ascend_batch_cached_suffix=args.ascend_batch_cached_suffix,
             use_uva=args.use_uva,
             cuda_graphs=args.cuda_graphs,
             cuda_graph_max_batch_size=args.cuda_graph_max_batch_size,

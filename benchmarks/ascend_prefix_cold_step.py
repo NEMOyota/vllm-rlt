@@ -18,10 +18,17 @@ class FrameworkCold(mixed.ThreePlusOne):
     profile_pair = None
     stock_methods = (*mixed.ThreePlusOne.stock_methods, "_prefill_attention", "_plan_cold_prefills")
 
+    def execution_options(self, mode):
+        return {"ascend_batch_cold_prefill": mode == self.candidate}
+
+    @staticmethod
+    def new_audit():
+        return dict(mixed.ThreePlusOne.new_audit(), cold_calls=0, suffix_calls=0)
+
     def run_variant(self, mode, audit, trial_args, trial_kwargs, profile_target=None):
         # Supply the option when the matrix builds its usual fresh StageEngine.
         workload = mixed.paired.workload
-        config = partial(workload.ExecutionConfig, ascend_batch_cold_prefill=mode == self.candidate)
+        config = partial(workload.ExecutionConfig, **self.execution_options(mode))
         with patch.object(workload, "ExecutionConfig", config):
             return super().run_variant(mode, audit, trial_args, trial_kwargs, profile_target)
 
@@ -34,8 +41,13 @@ class FrameworkCold(mixed.ThreePlusOne):
 
         def observe(kernel, *args):
             before = kernel.cold_prefill_calls
+            suffix_before = kernel.suffix_prefill_calls
             output = attend(kernel, *args)
-            audit["split_calls"] += kernel.cold_prefill_calls - before
+            cold = kernel.cold_prefill_calls - before
+            suffix = kernel.suffix_prefill_calls - suffix_before
+            audit["cold_calls"] += cold
+            audit["suffix_calls"] += suffix
+            audit["split_calls"] += int(bool(cold or suffix))
             return output
 
         # Count native execution only. The 3+1 prototype routing hook stays disabled.

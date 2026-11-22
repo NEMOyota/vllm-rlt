@@ -2,7 +2,7 @@
 """Explicit BF16 eager attention on Ascend, matching released Ouro arithmetic.
 
 Equal-length whole prompts share one attention call. An optional runner plan
-groups compatible cold prompts within a mixed-hit prefill. Independent
+groups compatible cold prompts and cached suffixes within a prefill. Independent
 single-row decode groups use ragged batching.
 """
 
@@ -54,6 +54,24 @@ def _prefill_geometry(rows):
     return size, width
 
 
+def _suffix_geometry(rows, group):
+    """Describe a complete contiguous noninitial query span from host metadata."""
+    if group is None:
+        return None
+    first, indices, positions, _, initial, _ = group
+    allocation, depth, start = rows[first]
+    width = indices.numel()
+    if initial or start < 1 or width < 2 or positions.numel() != start + width:
+        return None
+    span = rows[first : first + width]
+    if len(span) != width or any(
+        a is not allocation or d != depth or p != start + offset
+        for offset, (a, d, p) in enumerate(span)
+    ):
+        return None
+    return depth, start, width
+
+
 def _prefill_slots(blocks, offsets, flat_rows):
     flat_keys, _, rows_per_block = flat_rows
     return (blocks.to(torch.int64) * rows_per_block + offsets.to(torch.int64)).clamp(
@@ -77,9 +95,10 @@ class AscendEagerAttention:
         self._prefill_mask = None
         self._write_slots = None
         self._ragged_plan = None
-        self._cold_layout = None
-        self._cold_plan = None
+        self._prefill_layout = None
+        self._grouped_prefill_plan = None
         self.cold_prefill_calls = 0
+        self.suffix_prefill_calls = 0
         self.batched_prefill_calls = 0
         self.ragged_calls = 0
         self.fallback_calls = 0
@@ -151,27 +170,33 @@ class AscendEagerAttention:
         )
 
     @staticmethod
-    def _prefill_attention(q, flat_rows, slots, mask, geometry):
+    def _prefill_attention(q, flat_rows, slots, mask, geometry, *, cached_suffix=False):
         size, width = geometry
+        context = mask.shape[-1]
         flat_keys, flat_values, _ = flat_rows
         kv_heads, head_dim = flat_keys.shape[-2:]
         head_groups = q.shape[1] // kv_heads
         key = (
             flat_keys.index_select(0, slots)
-            .reshape(size, width, kv_heads, head_dim)
+            .reshape(size, context, kv_heads, head_dim)
             .transpose(1, 2)
         )
         value = (
             flat_values.index_select(0, slots)
-            .reshape(size, width, kv_heads, head_dim)
+            .reshape(size, context, kv_heads, head_dim)
             .transpose(1, 2)
         )
         if head_groups != 1:
             key = key.repeat_interleave(head_groups, dim=1)
             value = value.repeat_interleave(head_groups, dim=1)
+        if cached_suffix:
+            # Match the contiguous K/V layout of native noninitial prefill.
+            key, value = key.contiguous(), value.contiguous()
+        else:
+            mask = mask[None, None, :, :]
         query = q.reshape(size, width, q.shape[1], head_dim).transpose(1, 2).contiguous()
         scores = torch.matmul(query, key.transpose(-2, -1)) * (1.0 / math.sqrt(head_dim))
-        scores = scores + mask[None, None, :, :]
+        scores = scores + mask
         probabilities = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
         return torch.matmul(probabilities, value).transpose(1, 2).reshape_as(q)
 
@@ -195,6 +220,26 @@ class AscendEagerAttention:
             batches.append((rows, geometry, slots, _causal_mask(q, width)))
             used.update(starts)
         return batches, [g for g in self._groups if g[0] not in used]
+
+    @staticmethod
+    def _plan_suffix_prefills(batch, groups, flat_rows, block_size):
+        by_start = {g[0]: g for g in groups}
+        batches = []
+        used = set()
+        for starts in batch.suffix_prefill_groups:
+            members = [by_start.get(i) for i in starts]
+            shape = _suffix_geometry(batch.rows, members[0])
+            if shape is None or any(_suffix_geometry(batch.rows, g) != shape for g in members[1:]):
+                continue
+            positions = members[0][2]
+            pages = positions // block_size
+            blocks = torch.stack([batch.block_tables[i, pages] for i in starts])
+            slots = _prefill_slots(blocks, positions % block_size, flat_rows).flatten()
+            rows = torch.cat([g[1] for g in members])
+            masks = torch.stack([g[3] for g in members])[:, None]
+            batches.append((rows, (len(starts), shape[2]), slots, masks))
+            used.update(starts)
+        return batches, [g for g in groups if g[0] not in used]
 
     def _ragged_decode(self, q, keys, values, tables, groups, flat_rows, result):
         """One attention call for independent single-row decode groups."""
@@ -256,7 +301,7 @@ class AscendEagerAttention:
             self._prefill_mask = None
             self._write_slots = None
             self._ragged_plan = None
-            self._cold_layout = self._cold_plan = None
+            self._prefill_layout = self._grouped_prefill_plan = None
             self._metadata = weakref.ref(batch)
         if flat_rows is None:
             self.fallback_calls += 1
@@ -264,13 +309,22 @@ class AscendEagerAttention:
         if self._geometry is not None:
             self.batched_prefill_calls += 1
             return self._batched_prefill(q, keys, values, batch, flat_rows, self._geometry)
-        cold_batches, groups = (), self._groups
-        if getattr(batch, "cold_prefill_groups", ()):
-            layout = (flat_rows[2], flat_rows[0].shape[0], q.device, q.dtype)
-            if layout != self._cold_layout:
-                self._cold_plan = self._plan_cold_prefills(batch, flat_rows, q)
-                self._cold_layout = layout
-            cold_batches, groups = self._cold_plan
+        cold_batches, suffix_batches, groups = (), (), self._groups
+        has_cold = getattr(batch, "cold_prefill_groups", ())
+        has_suffix = getattr(batch, "suffix_prefill_groups", ())
+        if has_cold or has_suffix:
+            block_size = keys.shape[1]
+            layout = (block_size, flat_rows[2], flat_rows[0].shape[0], q.device, q.dtype)
+            if layout != self._prefill_layout:
+                if has_cold:
+                    cold_batches, groups = self._plan_cold_prefills(batch, flat_rows, q)
+                if has_suffix:
+                    suffix_batches, groups = self._plan_suffix_prefills(
+                        batch, groups, flat_rows, block_size
+                    )
+                self._grouped_prefill_plan = cold_batches, suffix_batches, groups
+                self._prefill_layout = layout
+            cold_batches, suffix_batches, groups = self._grouped_prefill_plan
         ragged, remaining = [], []
         for group in groups:
             if not group[4] and group[1].numel() == 1:
@@ -284,6 +338,12 @@ class AscendEagerAttention:
         result = self._forward(
             q, keys, values, batch.block_tables, remaining, flat_rows=flat_rows
         )
+        for rows, geometry, slots, mask in suffix_batches:
+            output = self._prefill_attention(
+                q.index_select(0, rows), flat_rows, slots, mask, geometry, cached_suffix=True
+            )
+            result.index_copy_(0, rows, output)
+            self.suffix_prefill_calls += 1
         for rows, geometry, slots, mask in cold_batches:
             output = self._prefill_attention(q[rows], flat_rows, slots, mask, geometry)
             if isinstance(rows, slice):

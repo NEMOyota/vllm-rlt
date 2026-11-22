@@ -153,10 +153,12 @@ class ExecutionConfig:
     prefill_uva: bool = False
     # Group complete cold prompts within ordinary Ascend mixed-hit prefills.
     ascend_batch_cold_prefill: bool = False
+    ascend_batch_cached_suffix: bool = False
 
     def __post_init__(self):
         for name in (
             "ascend_batch_cold_prefill",
+            "ascend_batch_cached_suffix",
             "prefill_uva",
             "use_uva",
             "async_scheduling",

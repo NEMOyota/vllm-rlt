@@ -11,6 +11,7 @@ import math
 from collections import Counter
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
+from itertools import combinations
 from pathlib import Path
 from statistics import median
 from unittest.mock import patch
@@ -213,6 +214,23 @@ def ttft_review(measured, candidate="merged", baseline="original"):
         arm: paired_ms(p50[baseline], p50[candidate], candidate, baseline)
         for arm, p50 in times.items()
     }
+
+
+def timing_comparisons(runs, modes):
+    measured = runs[1:]
+    comparisons = {}
+    for base, candidate in combinations(modes, 2):
+        summary = ttft_review(measured, candidate, base)
+        requests = {}
+        for i, row in enumerate(runs[0][base]["reuse"]["requests"]):
+            base_times = [r[base]["reuse"]["requests"][i]["ttft_ms"] for r in measured]
+            times = [r[candidate]["reuse"]["requests"][i]["ttft_ms"] for r in measured]
+            requests[f"target-{i}"] = dict(
+                hit_tokens=row["hit_tokens"],
+                **paired_ms(base_times, times, candidate, base),
+            )
+        comparisons[f"{base}_vs_{candidate}"] = dict(ttft=summary, reuse_requests=requests)
+    return {"comparisons": comparisons}
 
 
 class GateFailure(RuntimeError):

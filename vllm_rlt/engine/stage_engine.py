@@ -77,6 +77,8 @@ class StageEngine:
         )
         if self.execution_config.ascend_batch_cold_prefill and attention_backend != "ascend_eager":
             raise ValueError("ascend_batch_cold_prefill requires the ascend_eager backend")
+        if self.execution_config.ascend_batch_cached_suffix and attention_backend != "ascend_eager":
+            raise ValueError("ascend_batch_cached_suffix requires the ascend_eager backend")
         if parameter.device.type == "npu":
             if attention_backend not in ("torch", "ascend_eager"):
                 raise ValueError(

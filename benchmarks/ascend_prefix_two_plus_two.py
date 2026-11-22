@@ -4,7 +4,6 @@ import argparse
 import math
 from dataclasses import dataclass
 from functools import partial
-from itertools import combinations
 
 import torch
 
@@ -124,20 +123,7 @@ class TwoPlusTwo(mixed.ThreePlusOne):
         )
 
     def timing_summary(self):
-        measured = self.runs[1:]
-        comparisons = {}
-        for base, candidate in combinations(self.modes, 2):
-            summary = paired.ttft_review(measured, candidate, base)
-            requests = {}
-            for i, row in enumerate(self.runs[0][base]["reuse"]["requests"]):
-                base_times = [r[base]["reuse"]["requests"][i]["ttft_ms"] for r in measured]
-                times = [r[candidate]["reuse"]["requests"][i]["ttft_ms"] for r in measured]
-                requests[f"target-{i}"] = dict(
-                    hit_tokens=row["hit_tokens"],
-                    **paired.paired_ms(base_times, times, candidate, base),
-                )
-            comparisons[f"{base}_vs_{candidate}"] = dict(ttft=summary, reuse_requests=requests)
-        return {"comparisons": comparisons}
+        return paired.timing_comparisons(self.runs, self.modes)
 
 
 class ColdPairOnly(TwoPlusTwo):

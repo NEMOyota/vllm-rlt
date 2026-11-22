@@ -35,6 +35,26 @@ def _cold_prefill_groups(spans):
         if span.token_start == 0 and width > 1 and width == len(span.request.prompt_token_ids):
             buckets.setdefault((span.depth, width), []).append(row)
         row += width
+    return _partition_prefill_groups(buckets)
+
+
+def _suffix_prefill_groups(spans):
+    """Select complete suffixes beginning at a cache hit, in the current prefill step."""
+    row = 0
+    buckets = {}
+    for span in spans:
+        start, width = span.token_start, span.token_count
+        if (
+            start == span.request.prefill_window_origin > 0
+            and width > 1
+            and start + width == len(span.request.prompt_token_ids)
+        ):
+            buckets.setdefault((span.depth, start, width), []).append(row)
+        row += width
+    return _partition_prefill_groups(buckets)
+
+
+def _partition_prefill_groups(buckets):
     # The experiment covers widths up to four. Singletons retain their native path.
     groups = []
     for starts in buckets.values():
@@ -767,10 +787,21 @@ class ModelRunner:
                 packed=packed,
                 padded_rows=size,
             )
-            if self.execution_config.ascend_batch_cold_prefill:
-                groups = _cold_prefill_groups(batch.spans)
-                if groups:
-                    metadata = tuple(replace(kv, cold_prefill_groups=groups) for kv in metadata)
+            cold = (
+                _cold_prefill_groups(batch.spans)
+                if self.execution_config.ascend_batch_cold_prefill
+                else ()
+            )
+            suffix = (
+                _suffix_prefill_groups(batch.spans)
+                if self.execution_config.ascend_batch_cached_suffix
+                else ()
+            )
+            if cold or suffix:
+                metadata = tuple(
+                    replace(kv, cold_prefill_groups=cold, suffix_prefill_groups=suffix)
+                    for kv in metadata
+                )
         coda, coda_rows = self._prepare_prefill_coda(ids, positions, requests)
         forwards = [
             PreparedForward(
