@@ -75,6 +75,8 @@ class StageEngine:
         staged_prefill = requires_staged_prefill(
             scheduler_config, produces_tokens=self.stage_config.produces_tokens
         )
+        if self.execution_config.ascend_batch_cold_prefill and attention_backend != "ascend_eager":
+            raise ValueError("ascend_batch_cold_prefill requires the ascend_eager backend")
         if parameter.device.type == "npu":
             if attention_backend not in ("torch", "ascend_eager"):
                 raise ValueError(

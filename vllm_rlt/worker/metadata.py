@@ -39,6 +39,8 @@ class KVMetadata:
     writable: bool
     cu_seqlens_q: torch.Tensor | None = None
     max_seqlen_q: int = 1
+    # First query row of each complete prompt in each cold prefill group.
+    cold_prefill_groups: tuple[tuple[int, ...], ...] = ()
 
 
 @dataclass(frozen=True, eq=False)
@@ -255,6 +257,7 @@ class MetadataBuilder:
         return replace(
             metadata,
             rows=metadata.rows[start:end],
+            cold_prefill_groups=(),
             position_ids=metadata.position_ids[start:end],
             write_blocks=metadata.write_blocks[start:end],
             write_offsets=metadata.write_offsets[start:end],

@@ -151,9 +151,12 @@ class ExecutionConfig:
     # Select packed prefill metadata staging (and require packed attention).
     # The historical name is retained; use_uva controls its transfer mechanism.
     prefill_uva: bool = False
+    # Group complete cold prompts within ordinary Ascend mixed-hit prefills.
+    ascend_batch_cold_prefill: bool = False
 
     def __post_init__(self):
         for name in (
+            "ascend_batch_cold_prefill",
             "prefill_uva",
             "use_uva",
             "async_scheduling",

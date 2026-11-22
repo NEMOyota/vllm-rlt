@@ -24,6 +24,27 @@ from vllm_rlt.worker.submission_queue import MAX_CONCURRENT_SUBMISSIONS, Submiss
 from vllm_rlt.worker.tensors import StagedInputTensor, TensorTransfer, UvaBuffer, pinned_tensor
 
 
+def _cold_prefill_groups(spans):
+    """Bucket whole cold prompts by recurrence depth and width in a mixed-hit prefill."""
+    if not any(s.token_start == s.request.prefill_window_origin > 0 for s in spans):
+        return ()
+    buckets = {}
+    row = 0
+    for span in spans:
+        width = span.token_count
+        if span.token_start == 0 and width > 1 and width == len(span.request.prompt_token_ids):
+            buckets.setdefault((span.depth, width), []).append(row)
+        row += width
+    # The experiment covers widths up to four. Singletons retain their native path.
+    groups = []
+    for starts in buckets.values():
+        for i in range(0, len(starts), 4):
+            members = starts[i : i + 4]
+            if len(members) >= 2:
+                groups.append(tuple(members))
+    return tuple(groups)
+
+
 @dataclass
 class ReadbackSlot:
     storage: torch.Tensor
@@ -746,6 +767,10 @@ class ModelRunner:
                 packed=packed,
                 padded_rows=size,
             )
+            if self.execution_config.ascend_batch_cold_prefill:
+                groups = _cold_prefill_groups(batch.spans)
+                if groups:
+                    metadata = tuple(replace(kv, cold_prefill_groups=groups) for kv in metadata)
         coda, coda_rows = self._prepare_prefill_coda(ids, positions, requests)
         forwards = [
             PreparedForward(
