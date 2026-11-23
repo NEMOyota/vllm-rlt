@@ -41,7 +41,19 @@ NPU = (
     "drift",
     "profile",
 )
-GROUPING = ("grouped-matrix", "grouped-burst", "grouped-paced", "observe-burst", "observe-paced")
+LEGACY_GROUPING = ("grouped-matrix", "grouped-burst", "grouped-paced")
+GROUPING = (
+    "pr2-oracle",
+    "pr2-geometry",
+    "pr2-reference",
+    "pr2-burst",
+    "pr2-paced",
+    "observe-burst",
+    "observe-paced",
+    "pr2-profile",
+)
+GROUP_TEST = "tests/test_ascend_prefix_prefill_groups.py"
+PR2 = "benchmarks.ascend_prefix_pr2"
 HARNESS = (
     "benchmarks/ascend_main_prefix_combo.py",
     "benchmarks/ascend_main_prefix_linear.py",
@@ -53,6 +65,8 @@ HARNESS = (
     "benchmarks/ascend_main_prefix_service_worker.py",
     "benchmarks/ascend_prefix_pr1_diagnostics.py",
     "benchmarks/ascend_prefix_opportunities.py",
+    "benchmarks/ascend_prefix_pr2.py",
+    GROUP_TEST,
     CONTRACT,
 )
 
@@ -105,6 +119,7 @@ def stage_commands(args, out):
     )
     pytest("npu-contract", ["--run-npu", "-m", "npu", CONTRACT])
     pytest("stock-http", ["--run-npu", "tests/test_pr1_stock_http_replay.py" + HTTP_CASE])
+    pytest("pr2-oracle", ["--run-npu", "-m", "npu", GROUP_TEST])
 
     def benchmark(name, module, options):
         folder = out / name
@@ -131,6 +146,8 @@ def stage_commands(args, out):
         ("bf16", "paced"),
         ("grouped", "burst"),
         ("grouped", "paced"),
+        ("pr2", "burst"),
+        ("pr2", "paced"),
         ("observe", "burst"),
         ("observe", "paced"),
     ):
@@ -142,11 +159,13 @@ def stage_commands(args, out):
             "--seed",
             "168",
             "--rounds",
-            "1" if track == "observe" else "2",
+            {"observe": "1", "pr2": "3"}.get(track, "2"),
             "--rps",
             "3" if name == "paced" else "0",
         ]
-        if track != "grouped":
+        if track == "pr2":
+            options.extend(["--pr2-slack", "4"])
+        elif track != "grouped":
             options.append("--main-only")
         if track == "observe":
             options.append("--observe-prefill")
@@ -161,6 +180,9 @@ def stage_commands(args, out):
         ["benefit", "--main-only", "--all-cases", "--warmups", "1", "--repeats", "6"],
     )
     benchmark("grouped-matrix", MATRIX, ["bf16", "--repeats", "3"])
+    benchmark("pr2-geometry", PR2, ["--repeats", "3"])
+    benchmark("pr2-reference", PR2, ["--repeats", "3", "--linear-fp32-chunk", "256"])
+    benchmark("pr2-profile", PR2, ["--profile", "--case", "near"])
     benchmark("drift", DIAGNOSTICS, ["drift", "--matrix", str(out / "bf16-matrix" / "review.json")])
     benchmark("profile", DIAGNOSTICS, ["profile"])
     return {stage.name: stage for stage in stages}
@@ -284,12 +306,15 @@ def snapshot(out, report):
 
 
 def markdown_report(out, report):
-    title = "Ascend prefix cache 验证结果"
+    pr2 = report.get("pr2_scope", False)
+    title = "Ascend prefix cache 同批 attention 验收" if pr2 else "Ascend prefix cache 验证结果"
     lines = [
         f"# {title}",
         "",
         f"- 总状态 `{report['status']}`",
-        f"- PR 1 全量自动检查通过 `{report['full_pr1_pass']}`",
+        f"- PR 2 全量自动检查通过 `{report['full_pr2_scope'] and report['status'] == 'PASS'}`"
+        if pr2
+        else f"- PR 1 全量自动检查通过 `{report['full_pr1_pass']}`",
         f"- 候选代码 `{report['candidate']}`",
         f"- 测试工具 `{report['harness']}`",
         "",
@@ -350,7 +375,7 @@ def markdown_report(out, report):
         "arrival_ttft_p95_ms",
         "output_tok_s",
     )
-    for name in ("bf16-burst", "bf16-paced"):
+    for name in ("bf16-burst", "bf16-paced", "pr2-burst", "pr2-paced"):
         csv_path = out / name / "service.csv"
         if not csv_path.is_file():
             continue
@@ -377,6 +402,17 @@ def markdown_report(out, report):
         lines.extend(
             ["", f"[按冷热和长度查看]({name}/service.csv) · [逐请求审计]({name}/raw.jsonl)"]
         )
+        if name.startswith("pr2-"):
+            for mode, rounds in (
+                stage.get("evidence", {}).get("prefix_groups_per_round", {}).items()
+            ):
+                for i, row in enumerate(rounds, 1):
+                    lines.append(
+                        f"- {mode} 第 {i} 轮合批 {row.get('groups', 0)} 次，"
+                        f"其中补齐 {row.get('padded_groups', 0)} 次，省下 "
+                        f"{row.get('saved_sdpa_calls', 0)} 次 SDPA，新增 "
+                        f"{row.get('extra_score_cells', 0)} 个每头 Q×KV 位置。"
+                    )
     lines += [
         "",
         "提交前请核对输出分歧的首个 token 和证据、未执行项、"
@@ -392,7 +428,7 @@ def main(argv=None):
     p.add_argument(
         "--only",
         action="append",
-        choices=(*CPU, *NPU, *GROUPING),
+        choices=(*CPU, *NPU, *GROUPING, *LEGACY_GROUPING),
         help="Run a named stage; repeat to select multiple stages",
     )
     p.add_argument(
@@ -429,10 +465,19 @@ def main(argv=None):
         help="Print selected commands without executing or creating output",
     )
     args = p.parse_args(argv)
-    chosen = args.only or {"cpu": CPU, "npu": NPU, "all": CPU + NPU, "pr2": GROUPING}[args.scope]
+    pr2_stages = ("environment", *GROUPING)
+    chosen = args.only or {"cpu": CPU, "npu": NPU, "all": CPU + NPU, "pr2": pr2_stages}[args.scope]
     selected = set(chosen)
     # Checks of the untouched candidate precede installation of the harness.
-    order = ["pre-commit", "npu-regression", "environment", *CPU[1:], *NPU[2:], *GROUPING]
+    order = [
+        "pre-commit",
+        "npu-regression",
+        "environment",
+        *CPU[1:],
+        *NPU[2:],
+        *GROUPING,
+        *LEGACY_GROUPING,
+    ]
     names = [name for name in order if name in selected]
     if args.model:
         args.model = args.model.expanduser().resolve()
@@ -443,7 +488,11 @@ def main(argv=None):
     suffix = f"-{args.chip}" if args.chip else ""
     if args.chip and re.fullmatch("[0-9]+", selector):
         suffix += f"-card{selector}"
-    out = (args.out or (Path.cwd() / "results" / f"ascend-prefix-pr1{suffix}-{stamp}")).resolve()
+    pr2 = bool(selected.intersection(GROUPING))
+    suite_name = "pr2" if pr2 else "pr1"
+    out = (
+        args.out or (Path.cwd() / "results" / f"ascend-prefix-{suite_name}{suffix}-{stamp}")
+    ).resolve()
     stages = stage_commands(args, out)
     if args.list:
         for name in names:
@@ -471,6 +520,8 @@ def main(argv=None):
         expected_chip=args.chip,
         unpacked_policy=args.unpacked,
         full_pr1_scope=selected == set(CPU + NPU),
+        pr2_scope=pr2,
+        full_pr2_scope=selected == set(pr2_stages),
         stages={n: {"status": "NOT_RUN"} for n in names},
     )
     snapshot(out, report)

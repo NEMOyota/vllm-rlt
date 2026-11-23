@@ -114,9 +114,12 @@ def prompts(case, vocab):
     return donor, miss, targets
 
 
-def open_engine(model, case, arm):
+def open_engine(model, case, arm, *, prefix_prefill_slack=None):
     capacity = case.prefix + case.suffix + OUTPUTS - 1
     blocks = 4 * math.ceil(capacity / BLOCK) * (case.count if case.tight_pool else case.count + 1)
+    execution = ExecutionConfig(multi_stream=False, use_uva=False)
+    if prefix_prefill_slack is not None:
+        execution = replace(execution, ascend_prefix_prefill_slack=prefix_prefill_slack)
     return StageEngine(
         model,
         attention_backend="ascend_eager",
@@ -128,7 +131,7 @@ def open_engine(model, case, arm):
             prefill_chunk_size=capacity,
             max_num_batched_tokens=case.count * capacity,
         ),
-        execution_config=ExecutionConfig(multi_stream=False, use_uva=False),
+        execution_config=execution,
     )
 
 

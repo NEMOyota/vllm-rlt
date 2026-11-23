@@ -67,11 +67,13 @@ def trial_order(round_index, modes=MODES):
 
 
 @torch.inference_mode()
-def trial(model, case, mode, arm, inputs, *, linear_work=None):
+def trial(
+    model, case, mode, arm, inputs, *, linear_work=None, prefix_prefill_slack=None, capture=None
+):
     donor, miss, targets, fillers = inputs
     gc.collect()
     with attention_mode(mode):
-        engine = combo.open_engine(model, case, arm)
+        engine = combo.open_engine(model, case, arm, prefix_prefill_slack=prefix_prefill_slack)
     cache = engine.cache_manager
     starts = case.starts(arm)
     try:
@@ -107,6 +109,11 @@ def trial(model, case, mode, arm, inputs, *, linear_work=None):
         engine.model_runner.synchronize()
         prefix_hits, queries = cache.prefix_hits, cache.prefix_queries
         kernel = cache.attention.kernel
+        require(
+            getattr(kernel, "prefix_prefill_slack", None) == prefix_prefill_slack,
+            "unexpected production prefix grouping policy",
+        )
+        prefix_before = dict(getattr(kernel, "prefix_group_stats", {}))
         groups_before = group_counts(kernel)
         if linear_work is not None:
             linear_work[1].clear()
@@ -117,7 +124,12 @@ def trial(model, case, mode, arm, inputs, *, linear_work=None):
             engine.add_request(rid, tokens, params)
         schedule = None
         while engine.has_unfinished_requests():
-            outputs = engine.step()
+            if capture is not None and schedule is None:
+                with capture:
+                    outputs = engine.step()
+                    engine.model_runner.synchronize()
+            else:
+                outputs = engine.step()
             visible = tick()
             if schedule is None:
                 schedule = engine.last_schedule
@@ -171,6 +183,12 @@ def trial(model, case, mode, arm, inputs, *, linear_work=None):
                 hit_tokens=origins[rid],
             )
         work_stats = {}
+        work_stats["prefix_groups"] = {
+            key: value - prefix_before.get(key, 0)
+            for key, value in getattr(kernel, "prefix_group_stats", {}).items()
+        }
+        work_stats["prefill_rows"] = schedule.num_tokens
+        work_stats["layer_traversals"] = calls
         if linear_work is not None:
             work_stats["linear_work"] = linear_usage(linear_work)
             check_linear_usage(work_stats["linear_work"])

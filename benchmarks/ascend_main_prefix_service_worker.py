@@ -71,11 +71,22 @@ def observed_worker(mode, audit_path, *args, linear_fp32_chunk=None, **kwargs):
             prefix_hits=cache.prefix_hits,
             prefix_queries=cache.prefix_queries,
             group_calls=group_counts(cache.attention.kernel),
-            grouping_enabled=isinstance(cache.attention.kernel, GroupedAscendAttention),
+            grouping_enabled=isinstance(cache.attention.kernel, GroupedAscendAttention)
+            or getattr(cache.attention.kernel, "prefix_prefill_slack", None) is not None,
+            prefix_prefill_slack=getattr(cache.attention.kernel, "prefix_prefill_slack", None),
+            prefix_groups=dict(getattr(cache.attention.kernel, "prefix_group_stats", {})),
             live_blocks=cache.num_used_blocks,
         )
         if work is not None:
             state["linear_work"] = linear_usage(work)
+        if steps and hasattr(cache.attention.kernel, "prefix_group_stats"):
+            element_bytes = (
+                engine.model.config.head_dim * next(engine.model.parameters()).element_size()
+            )
+            state["attention_row_bytes"] = [
+                element_bytes * engine.model.config.num_attention_heads,
+                element_bytes * cache.num_kv_heads,
+            ]
         close(engine)
 
     try:

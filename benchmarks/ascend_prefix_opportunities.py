@@ -36,11 +36,15 @@ def observe_prefill(steps):
         yield
 
 
-def opportunities(steps, plan, tolerances=(0, 2, 4, 8)):
+def opportunities(steps, plan, tolerances=(0, 2, 4, 8), *, row_bytes=None):
     targets = {r["prompt_sha256"] for r in plan}
     seen = set()
     widths = Counter()
     with_partner = dict.fromkeys(tolerances, 0)
+    predicted = {
+        slack: Counter(groups=0, members=0, saved_sdpa_calls=0, padded_groups=0)
+        for slack in tolerances
+    }
     total = regular = 0
     for step in steps:
         members = [m for m in step["members"] if m["prompt_sha256"] in targets]
@@ -60,6 +64,19 @@ def opportunities(steps, plan, tolerances=(0, 2, 4, 8)):
         ):
             regular += len(members)
             continue  # Already handled by the mainline complete cold-grid path.
+        if row_bytes is not None:
+            from vllm_rlt.kernels.ascend_prefix_prefill import Span, partition
+
+            spans = [Span(i, 0, 0, m["start"], m["query_rows"]) for i, m in enumerate(members)]
+            for slack, counts in predicted.items():
+                groups, _ = partition(
+                    spans, slack, q_row_bytes=row_bytes[0], kv_row_bytes=row_bytes[1]
+                )
+                for group in groups:
+                    counts["groups"] += 1
+                    counts["members"] += len(group)
+                    counts["saved_sdpa_calls"] += len(group) - 1
+                    counts["padded_groups"] += len({(s.width, s.context) for s in group}) > 1
         for i, x in enumerate(members):
             if x["query_rows"] <= 1:
                 continue
@@ -78,4 +95,5 @@ def opportunities(steps, plan, tolerances=(0, 2, 4, 8)):
         steps_by_size=dict(widths),
         already_regular_cold_members=regular,
         additional_members_with_partner=with_partner,
+        predicted_groups_per_layer_per_depth=predicted if row_bytes is not None else None,
     )

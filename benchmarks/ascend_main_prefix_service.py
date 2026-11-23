@@ -269,8 +269,9 @@ async def burst(client, url, model, plan, concurrency):
     return rows, wall
 
 
-def reconcile(mode, primers, plan, rows, audit, *, linear_fp32_chunk=None):
+def reconcile(mode, primers, plan, rows, audit, *, linear_fp32_chunk=None, pr2_slack=None):
     state = audit["state"]
+    expected_slack = {"exact": 0, "similar": pr2_slack}.get(mode)
     require(
         state.get("backend") == "ascend_eager"
         and state["packed"]
@@ -279,7 +280,8 @@ def reconcile(mode, primers, plan, rows, audit, *, linear_fp32_chunk=None):
         and not state["async_scheduling"]
         and not state["multi_stream"]
         and state["prefix_enabled"] == (mode != "off")
-        and state["grouping_enabled"] == (mode == "grouped")
+        and state["grouping_enabled"] == (mode in ("grouped", "exact", "similar"))
+        and state.get("prefix_prefill_slack") == expected_slack
         and state.get("linear_fp32_chunk") == linear_fp32_chunk,
         f"unexpected service configuration {state}",
     )
@@ -417,6 +419,10 @@ async def run_mode(args, report, mode, n, primers, plan, num_blocks, width):
     ]
     if mode != "off":
         command.append("--enable-prefix-caching")
+    if mode in ("exact", "similar"):
+        command.extend(
+            ["--ascend-prefix-prefill-slack", str(0 if mode == "exact" else args.pr2_slack)]
+        )
     env = dict(
         os.environ,
         RLT_BENCH_ATTENTION="grouped" if mode == "grouped" else "main",
@@ -438,13 +444,22 @@ async def run_mode(args, report, mode, n, primers, plan, num_blocks, width):
             report.record("HTTP_RESPONSES", mode=mode, round=n, requests=rows)
     captured = json.loads(audit.read_text())
     issues = reconcile(
-        mode, primers, plan, rows, captured, linear_fp32_chunk=args.linear_fp32_chunk
+        mode,
+        primers,
+        plan,
+        rows,
+        captured,
+        linear_fp32_chunk=args.linear_fp32_chunk,
+        pr2_slack=getattr(args, "pr2_slack", None),
     )
     stats = summary(rows, wall)
     if args.observe_prefill:
-        counts = opportunities(captured["prefill_steps"], plan)
+        counts = opportunities(
+            captured["prefill_steps"], plan, row_bytes=captured["state"].get("attention_row_bytes")
+        )
         (folder / "opportunities.json").write_text(json.dumps(counts, indent=2) + "\n")
     stats["group_calls"] = captured["state"]["group_calls"]
+    stats["prefix_groups"] = captured["state"].get("prefix_groups", {})
     report.record(
         "SERVICE_RUN",
         mode=mode,
@@ -500,7 +515,8 @@ def service_diffs(base, rows, label, n):
 
 
 async def exercise(args, report):
-    modes = ("off", "main") if args.main_only else MODES
+    pr2 = getattr(args, "pr2_slack", None) is not None
+    modes = ("main", "exact", "similar") if pr2 else (("off", "main") if args.main_only else MODES)
     primers, plan = traffic(
         load_tokenizer(str(args.model.resolve())), args.requests, args.rps, args.seed
     )
@@ -523,11 +539,12 @@ async def exercise(args, report):
     first = {}
     latencies = {mode: [] for mode in modes}
     grouped_calls = []
+    prefix_groups = defaultdict(list)
     for i in range(args.rounds):
         runs = {}
-        offset = (i // 2) % len(modes)
+        offset = (i if pr2 else i // 2) % len(modes)
         order = modes[offset:] + modes[:offset]
-        if i % 2:
+        if (i // len(modes) if pr2 else i) % 2:
             order = order[::-1]
         for mode in order:
             report.location = dict(round=i + 1, mode=mode)
@@ -542,6 +559,8 @@ async def exercise(args, report):
             runs[mode] = rows
             if mode == "grouped":
                 grouped_calls.append(s["group_calls"])
+            if pr2:
+                prefix_groups[mode].append(s["prefix_groups"])
             latencies[mode].append(s["overall"]["ttft_ms"]["p50"])
             for cohort, m in {"all": s["overall"], **s["cohorts"]}.items():
                 csv_rows.append(
@@ -568,11 +587,32 @@ async def exercise(args, report):
                 )
         for a, b in combinations(modes, 2):
             diffs.extend(service_diffs(runs[a], runs[b], f"{a}_vs_{b}", i + 1))
+            if pr2:
+                for left, right in zip(runs[a], runs[b], strict=True):
+                    if left.get("cached_tokens") != right.get("cached_tokens"):
+                        errors.append(
+                            dict(
+                                control="different cache hits",
+                                round=i + 1,
+                                id=left["id"],
+                                modes=[a, b],
+                                hits=[left.get("cached_tokens"), right.get("cached_tokens")],
+                            )
+                        )
     write_csv(report.folder / "service.csv", csv_rows)
     report.record("SERVICE_CHECKS", control_issues=errors, output_diffs=diffs)
     paired = {}
     if not args.observe_prefill and not errors and not diffs:
-        paired["off_to_main"] = savings(latencies["off"], latencies["main"])
+        if pr2:
+            for before, after, counter in (
+                ("main", "exact", "groups"),
+                ("main", "similar", "groups"),
+                ("exact", "similar", "padded_groups"),
+            ):
+                if all(row.get(counter, 0) > 0 for row in prefix_groups[after]):
+                    paired[f"{before}_to_{after}"] = savings(latencies[before], latencies[after])
+        else:
+            paired["off_to_main"] = savings(latencies["off"], latencies["main"])
         if grouped_calls and all(sum(counts.values()) > 0 for counts in grouped_calls):
             for mode in ("off", "main"):
                 paired[f"{mode}_to_grouped"] = savings(latencies[mode], latencies["grouped"])
@@ -586,6 +626,7 @@ async def exercise(args, report):
         output_diffs=len(diffs),
         examples=(errors + diffs)[:6],
         grouped_calls_per_round=grouped_calls,
+        prefix_groups_per_round=dict(prefix_groups),
         paired_ttft=paired,
     )
 
@@ -602,6 +643,9 @@ def main(argv=None):
         help="Offered Poisson arrivals/s; 0 offers a burst with bounded client concurrency",
     )
     p.add_argument("--rounds", type=int, default=2)
+    p.add_argument(
+        "--pr2-slack", type=int, help="Compare cache-on main/exact/similar via the stock CLI"
+    )
     add_precision_arg(p)
     p.add_argument("--seed", type=int, default=SEED)
     p.add_argument("--num-blocks", type=int, help="Override pool that otherwise fits all prompts")
@@ -625,6 +669,7 @@ def main(argv=None):
     args = p.parse_args(argv)
     if (
         not args.model.is_dir()
+        or (args.pr2_slack is not None and (args.pr2_slack <= 0 or args.main_only))
         or args.requests < 1
         or args.rounds < 1
         or args.concurrency < 1

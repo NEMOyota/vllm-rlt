@@ -109,8 +109,10 @@ vLLM 的核心用例验证块复用和逐出。vLLM-Ascend 的双卡用例对共
 
 ## PR 2 的独立实验
 
+在 `exp/ascend-prefix-pr2-grouping` 分支，`pr2` 执行正式后端上的等长与近似长度合批验收，包括实际设备、六组真权重受控回放、HTTP 混合负载、机会观测及目标 prefill 的设备 trace。[PR 2 运行、设计与验收说明](ascend_prefix_pr2.md)
+
 ```bash
 python -m benchmarks.ascend_prefix_pr1_suite pr2
 ```
 
-该入口复用 BF16 30 例矩阵以及 burst/paced，并保留 `main → grouped` 的单独比较。它还各做一轮单独的调度观测。查看 `observe-{burst,paced}/round-1-main/opportunities.json` 和同目录 `worker.json` 的 `prefill_steps`。记录包括同一步的成员、请求摘要、循环深度、起点、剩余长度、Q 行数和可见 KV 长度。分母为目标请求参与 prefill 的“请求 × 步”次数，剔除 primer。已被主线整齐冷批覆盖的成员另计。阈值 0/2/4/8 给出同起点、同批、存在一个长度相容伙伴的成员数。阈值是包含关系。这些数值衡量机会，不等于能同时成组的数量或实测速率。观测轮的计时只供诊断。近似长度计算仍属于后续设计。
+历史 benchmark 原型的入口仍可单独运行 `--only grouped-matrix`、`--only grouped-burst` 和 `--only grouped-paced`。它们用于复现原有等长原型的数据。
