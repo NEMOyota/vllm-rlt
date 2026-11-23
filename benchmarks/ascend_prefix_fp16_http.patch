@@ -1,0 +1,7 @@
+--- a/vllm_rlt/entrypoints/serve.py
++++ b/vllm_rlt/entrypoints/serve.py
+@@ -86,3 +86,3 @@
+     parser.add_argument("--device", choices=["cpu", "cuda", "npu"], default="cuda")
+-    parser.add_argument("--dtype", choices=["bfloat16", "float32"], default="bfloat16")
++    parser.add_argument("--dtype", choices=["bfloat16", "float32", "float16"], default="bfloat16")
+     parser.add_argument(

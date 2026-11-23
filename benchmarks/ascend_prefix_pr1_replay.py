@@ -10,6 +10,7 @@ import torch
 from benchmarks import ascend_main_prefix_combo as combo
 from benchmarks.ascend_main_prefix_linear import (
     add_precision_arg,
+    benchmark_dtype,
     check_linear_usage,
     linear_usage,
     padded_fp32_linears,
@@ -155,8 +156,10 @@ def replay(model, tokenizer, report, names, *, linear_work=None):
                 require(
                     engine.execution_config.packed_prefill
                     and engine.cache_manager.backend == "ascend_eager"
-                    and engine.cache_manager.dtype == torch.bfloat16,
-                    "expected packed BF16 ascend_eager",
+                    and engine.cache_manager.key_cache.dtype
+                    == engine.cache_manager.value_cache.dtype
+                    == next(model.parameters()).dtype,
+                    "expected packed native-dtype ascend_eager",
                 )
                 for request, prompt in prompts.items():
                     report.location = dict(case=name, mode=mode, request=request)
@@ -248,11 +251,11 @@ def main():
 
     def run(args, device, report):
         model = OuroForCausalLM.from_pretrained(
-            args.model, device=device, dtype=torch.bfloat16
+            args.model, device=device, dtype=benchmark_dtype()
         ).eval()
         require(
-            all(p.dtype == torch.bfloat16 for p in model.parameters()),
-            "expected BF16 checkpoint weights",
+            all(p.dtype == benchmark_dtype() for p in model.parameters()),
+            "unexpected checkpoint weight dtype",
         )
         tokenizer = load_tokenizer(str(args.model.resolve()))
         with padded_fp32_linears(model, args.linear_fp32_chunk) as work:

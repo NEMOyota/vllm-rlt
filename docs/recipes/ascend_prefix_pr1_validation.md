@@ -1,5 +1,7 @@
 # Ouro 昇腾 prefix cache 提交前验证
 
+两轮正确性、三轮性能及多卡执行见[并行验收](ascend_prefix_parallel.md)。
+
 PR 1 的评审问题是，在一张昇腾卡上用原生 BF16 运行 Ouro 时，普通同步单流 prefill 能否安全复用整页前缀，热请求省了多少工作，冷请求付出了什么成本。主实验使用 Ouro-1.4B、`ascend_eager`、`last_exited`、greedy、四次循环和 16-token 页。这个测试分支以实验提交 `fca4514` 为基线，生产代码在 `vllm_rlt/`。正式服务用例和运行时配置回归集中在本分支第一个测试提交，供精简 PR 复用。
 
 ## 在 910B3 与 910B4 上运行同一套检查

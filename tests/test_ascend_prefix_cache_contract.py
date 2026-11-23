@@ -6,6 +6,12 @@ from dataclasses import replace
 import pytest
 import torch
 
+from benchmarks.ascend_main_prefix_linear import (
+    benchmark_dtype,
+    check_linear_usage,
+    linear_usage,
+    padded_fp32_linears,
+)
 from tests.test_device import npu_model_stub
 from vllm_rlt import (
     CacheConfig,
@@ -99,7 +105,12 @@ def ouro_checkpoint():
         pytest.skip("set VLLM_RLT_OURO_CHECKPOINT to local Ouro weights")
     device = resolve_device("npu:0")
     torch.npu.set_device(device)
-    return OuroForCausalLM.from_pretrained(folder, device=device, dtype=torch.bfloat16).eval()
+    model = OuroForCausalLM.from_pretrained(folder, device=device, dtype=benchmark_dtype()).eval()
+    rows = os.environ.get("RLT_BENCH_LINEAR_FP32_CHUNK")
+    with padded_fp32_linears(model, int(rows) if rows else None) as work:
+        yield model
+        if work is not None:
+            check_linear_usage(linear_usage(work))
 
 
 @pytest.mark.npu

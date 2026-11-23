@@ -21,7 +21,11 @@ from uuid import uuid4
 import aiohttp
 
 from benchmarks.ascend_main_prefix_combo import BLOCK, SEED
-from benchmarks.ascend_main_prefix_linear import add_precision_arg, check_linear_usage
+from benchmarks.ascend_main_prefix_linear import (
+    add_precision_arg,
+    benchmark_dtype,
+    check_linear_usage,
+)
 from benchmarks.ascend_main_prefix_results import Report, ids_digest, quantiles, savings, write_csv
 from benchmarks.ascend_prefix_combo_checks import require
 from benchmarks.ascend_prefix_opportunities import opportunities
@@ -274,8 +278,8 @@ def reconcile(mode, primers, plan, rows, audit, *, linear_fp32_chunk=None):
     require(
         state.get("backend") == "ascend_eager"
         and state["packed"]
-        and state["dtype"] == "torch.bfloat16"
-        and state["linear_weight_dtypes"] == ["torch.bfloat16"]
+        and state["dtype"] == str(benchmark_dtype())
+        and state["linear_weight_dtypes"] == [str(benchmark_dtype())]
         and not state["async_scheduling"]
         and not state["multi_stream"]
         and state["prefix_enabled"] == (mode != "off")
@@ -376,7 +380,7 @@ def summary(rows, wall):
 async def run_mode(args, report, mode, n, primers, plan, num_blocks, width):
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
+        port = int(os.environ.get("RLT_BENCH_PORT") or sock.getsockname()[1])
     folder = report.folder / f"round-{n}-{mode}"
     folder.mkdir()
     url = f"http://127.0.0.1:{port}"
@@ -393,7 +397,7 @@ async def run_mode(args, report, mode, n, primers, plan, num_blocks, width):
         "--device",
         "npu",
         "--dtype",
-        "bfloat16",
+        str(benchmark_dtype()).removeprefix("torch."),
         "--attention-backend",
         "ascend_eager",
         "--single-stream",
@@ -538,7 +542,7 @@ async def exercise(args, report):
             if mode in first:
                 diffs.extend(service_diffs(first[mode], rows, f"{mode}_vs_first", i + 1))
             else:
-                first[mode] = rows
+                first.setdefault(mode, rows)
             runs[mode] = rows
             if mode == "grouped":
                 grouped_calls.append(s["group_calls"])
@@ -580,9 +584,19 @@ async def exercise(args, report):
         "FAIL" if errors or diffs else "PASS",
         requests_per_mode=args.requests,
         rounds=args.rounds,
+        correctness_rounds=getattr(args, "correctness_rounds", args.rounds),
         modes=list(modes),
         diagnostic_replay=args.observe_prefill,
         control_issues=len(errors),
+        correctness_status=(
+            "FAIL"
+            if any(
+                r["round"] <= getattr(args, "correctness_rounds", args.rounds)
+                for r in errors + diffs
+            )
+            else "PASS"
+        ),
+        performance_valid=not (errors or diffs),
         output_diffs=len(diffs),
         examples=(errors + diffs)[:6],
         grouped_calls_per_round=grouped_calls,
@@ -601,6 +615,7 @@ def main(argv=None):
         default=0,
         help="Offered Poisson arrivals/s; 0 offers a burst with bounded client concurrency",
     )
+    p.add_argument("--correctness-rounds", type=int)
     p.add_argument("--rounds", type=int, default=2)
     add_precision_arg(p)
     p.add_argument("--seed", type=int, default=SEED)
@@ -623,6 +638,10 @@ def main(argv=None):
         help="Record per-step geometry in a diagnostic replay; exclude latency comparisons",
     )
     args = p.parse_args(argv)
+    if args.correctness_rounds is None:
+        args.correctness_rounds = args.rounds
+    if not 1 <= args.correctness_rounds <= args.rounds:
+        p.error("correctness rounds must fit within measured rounds")
     if (
         not args.model.is_dir()
         or args.requests < 1

@@ -14,6 +14,7 @@ from benchmarks.ascend_main_prefix_combo import ARMS, BLOCK, OUTPUTS, Case
 from benchmarks.ascend_main_prefix_grouping import attention_mode, group_counts
 from benchmarks.ascend_main_prefix_linear import (
     add_precision_arg,
+    benchmark_dtype,
     check_linear_usage,
     linear_usage,
     padded_fp32_linears,
@@ -67,7 +68,8 @@ def trial_order(round_index, modes=MODES):
 
 
 @torch.inference_mode()
-def trial(model, case, mode, arm, inputs, *, linear_work=None, dtype=torch.bfloat16):
+def trial(model, case, mode, arm, inputs, *, linear_work=None, dtype=None):
+    dtype = benchmark_dtype() if dtype is None else dtype
     donor, miss, targets, fillers = inputs
     gc.collect()
     with attention_mode(mode):
@@ -258,7 +260,7 @@ def run_cases(args, model, report, names, *, linear_work=None, modes=MODES):
                         for d in combo.token_diffs(first[key], result, "same_arm_first_run")
                     )
                 else:
-                    first[key] = result
+                    first.setdefault(key, result)
             for mode, arm in burst:
                 # Compare cache states within a mode, then compare modes within a cache state.
                 checks = []
@@ -279,7 +281,14 @@ def run_cases(args, model, report, names, *, linear_work=None, modes=MODES):
             failed.append(name)
             for label in sorted({issue.get("comparison", "control") for issue in issues}):
                 failed_comparisons.setdefault(label, []).append(name)
+        formal = [
+            d
+            for d in issues
+            if 1 <= d["round"] <= getattr(args, "correctness_rounds", args.repeats)
+        ]
         summary = dict(
+            correctness_status="FAIL" if formal else "PASS",
+            performance_valid=not issues,
             case=name,
             status="FAIL" if issues else "PASS",
             issues=len(issues),
@@ -338,6 +347,7 @@ def run_cases(args, model, report, names, *, linear_work=None, modes=MODES):
         failed_comparisons=failed_comparisons,
         warmups=args.warmups,
         repeats=args.repeats,
+        correctness_rounds=getattr(args, "correctness_rounds", args.repeats),
         modes=list(modes),
         **({"paired_ttft_saved_ms": benefit_by_case} if args.experiment == "benefit" else {}),
     )
@@ -352,6 +362,7 @@ def main(argv=None):
     group.add_argument(
         "--all-cases", action="store_true", help="Also time all 30 cases in benefit mode"
     )
+    p.add_argument("--correctness-rounds", type=int, help="Measured rounds with token comparisons")
     p.add_argument("--warmups", type=int)
     p.add_argument("--repeats", type=int)
     add_precision_arg(p)
@@ -369,6 +380,10 @@ def main(argv=None):
         args.repeats = 3 if correctness else 6
     if args.warmups is None:
         args.warmups = 0 if correctness else 1
+    if args.correctness_rounds is None:
+        args.correctness_rounds = args.repeats
+    if not 1 <= args.correctness_rounds <= args.repeats:
+        p.error("correctness rounds must fit within measured rounds")
     if args.repeats < 1 or args.warmups < 0 or not args.model.is_dir():
         p.error("provide a local model, positive repeats and nonnegative warmups")
     names = list(dict.fromkeys(args.case or (FULL if correctness or args.all_cases else BENEFIT)))
@@ -377,7 +392,7 @@ def main(argv=None):
 
     def run(args, device, report):
         model = OuroForCausalLM.from_pretrained(
-            args.model, device=device, dtype=torch.bfloat16
+            args.model, device=device, dtype=benchmark_dtype()
         ).eval()
         report.location = {"phase": "install_linears"}
         with padded_fp32_linears(model, args.linear_fp32_chunk) as work:

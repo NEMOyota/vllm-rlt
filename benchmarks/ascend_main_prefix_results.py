@@ -3,6 +3,7 @@
 import csv
 import hashlib
 import json
+import os
 import struct
 import traceback
 from datetime import datetime, timezone
@@ -10,7 +11,7 @@ from pathlib import Path
 from statistics import median
 
 from benchmarks.ascend_main_prefix_combo import environment
-from benchmarks.ascend_main_prefix_linear import precision_settings
+from benchmarks.ascend_main_prefix_linear import benchmark_dtype, precision_settings
 from benchmarks.preemption import checkpoint_identity, percentile
 from vllm_rlt.device import resolve_device
 
@@ -49,7 +50,7 @@ def write_csv(path, rows):
 class Report:
     def __init__(self, kind, folder, *, linear_fp32_chunk=None, compare_chunk=None):
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        self.math = precision_settings(linear_fp32_chunk)
+        self.math = precision_settings(linear_fp32_chunk, dtype=benchmark_dtype())
         suffix = "" if linear_fp32_chunk is None else f"-fp32-r{linear_fp32_chunk}"
         if compare_chunk is not None:
             self.math.pop("linear_fp32_chunk")
@@ -81,8 +82,10 @@ class Report:
             import torch
 
             torch.npu.set_device(device)
-            info = environment(device)
-            info["execution"] = "single-stream synchronous ascend_eager, BF16 KV and packed SDPA"
+            info = environment(device, dtype=benchmark_dtype())
+            info["execution"] = (
+                "single-stream synchronous ascend_eager, native-dtype KV and packed SDPA"
+            )
             info["native_allow_hf32"] = getattr(
                 getattr(torch.npu, "matmul", None), "allow_hf32", None
             )
@@ -94,7 +97,11 @@ class Report:
                 "ENV",
                 **info,
                 arguments={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
-                checkpoint=checkpoint_identity(args.model),
+                checkpoint=(
+                    json.loads(Path(identity).read_text())
+                    if (identity := os.environ.get("RLT_BENCH_CHECKPOINT_JSON"))
+                    else checkpoint_identity(args.model)
+                ),
             )
             return run(args, device, self)
         except Exception as error:

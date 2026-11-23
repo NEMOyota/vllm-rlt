@@ -1,5 +1,6 @@
 """Select one linear precision for every arm of a synchronous Ouro experiment."""
 
+import os
 from collections import Counter
 from contextlib import ExitStack, contextmanager
 from functools import partial
@@ -8,6 +9,13 @@ from unittest.mock import patch
 import torch
 from torch import nn
 from torch.nn import functional as F
+
+
+def benchmark_dtype():
+    name = os.environ.get("RLT_BENCH_DTYPE", "bfloat16")
+    if name not in ("bfloat16", "float16"):
+        raise ValueError(f"unsupported benchmark dtype {name}")
+    return getattr(torch, name)
 
 
 def precision_settings(rows, *, dtype=torch.bfloat16):
