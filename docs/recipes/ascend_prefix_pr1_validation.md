@@ -2,38 +2,56 @@
 
 PR 1 的评审问题是，在一张昇腾卡上用原生 BF16 运行 Ouro 时，普通同步单流 prefill 能否安全复用整页前缀，热请求省了多少工作，冷请求付出了什么成本。主实验使用 Ouro-1.4B、`ascend_eager`、`last_exited`、greedy、四次循环和 16-token 页。这个测试分支以实验提交 `fca4514` 为基线，生产代码在 `vllm_rlt/`。正式服务用例和运行时配置回归集中在本分支第一个测试提交，供精简 PR 复用。
 
-## 在 910B4 上运行
+## 在 910B3 与 910B4 上运行同一套检查
 
 在已有 fork 检出中执行下面的命令。独立工作树可与已有的 FP16 工作树并存。
 
 ```bash
 git fetch https://github.com/NEMOyota/vllm-rlt.git refs/heads/test/ascend-prefix-pr1-validation
-git worktree add --detach ../rlt-prefix-pr1-tests FETCH_HEAD
-cd ../rlt-prefix-pr1-tests
+git worktree add --detach ../rlt-prefix-dual-tests FETCH_HEAD
+cd ../rlt-prefix-dual-tests
 ```
 
-激活已有的 CANN / torch-npu Python 环境。完整运行还会调用 `git`、`pre-commit`、项目的 CPU 开发依赖（pytest、Ruff 等）以及 torch-npu 的设备 profiler。指定分配给本次实验的单卡和本地权重。下面以分配到卡 2 为例。
+两台机器检出同一测试提交，激活各自的 CANN / torch-npu 环境，指定本地的同一份 Ouro-1.4B 权重。完整运行还会调用 `git`、`pre-commit`、项目的 CPU 开发依赖（pytest、Ruff 等）以及 torch-npu 的设备 profiler。下面的卡号是示例，请替换为分配给实验的空闲卡。
 
 ```bash
-export ASCEND_RT_VISIBLE_DEVICES=2
+# 910B3 八卡服务器，选一张分配到的卡
 export MODEL=/models/Ouro-1.4B
-python -m benchmarks.ascend_prefix_pr1_suite all
+ASCEND_RT_VISIBLE_DEVICES=0 python -m benchmarks.ascend_prefix_pr1_suite all --chip 910B3
+
+# 910B4 服务器，在该机的 shell 中执行
+export MODEL=/models/Ouro-1.4B
+ASCEND_RT_VISIBLE_DEVICES=2 python -m benchmarks.ascend_prefix_pr1_suite all --chip 910B4
 ```
 
-入口打印 `RESULTS` 的绝对路径。每个阶段有独立日志。可在另一终端用 `tail -f` 查看。默认创建新的 `results/ascend-prefix-pr1-<UTC时间>/`。全量测量包含两种精度的完整矩阵、真实模型加载和设备 trace 导出，适合独占实验卡夜跑。可以先看实际命令或先补缺失的两个服务基线。
+两个型号使用相同的阶段、精度、负载和判定规则。PR 1 每个 worker 使用逻辑卡 `npu:0`。B3 八卡节点的整机 HBM 和主存可以单列为机器规格，每份性能结果对应所选的一张卡。另选空闲卡复测时使用新的结果目录，分别保留每张卡的数据。
+
+入口打印 `RESULTS` 的绝对路径。使用 `--chip` 及单卡选择器时默认创建 `results/ascend-prefix-pr1-<型号>-card<选择器>-<UTC时间>/`。测试前的独立进程记录运行时设备名、可见卡数、逻辑卡、该卡 HBM 字节数及操作系统可见物理内存。容器可重映射卡号，报告保留传给 `ASCEND_RT_VISIBLE_DEVICES` 的原值。型号冲突或指定多卡会使硬件阶段记为 INCOMPLETE。若运行时仅返回家族名，仍执行检查并保留数据，型号标为 unverified，不能据此声明指定型号已全量通过。可结合 `environment/npu-smi.txt` 和平台分配记录核实。省略 `--chip` 可沿用原有入口。
+
+全量测量包含两种精度的完整矩阵、模型加载和设备 trace 导出，适合独占实验卡夜跑。可以先查看命令，或在已设定 MODEL 的机器上先采集设备记录与原生 BF16 服务基线。
 
 ```bash
-python -m benchmarks.ascend_prefix_pr1_suite all --list
-python -m benchmarks.ascend_prefix_pr1_suite --only bf16-burst --only bf16-paced
+python -m benchmarks.ascend_prefix_pr1_suite all --chip 910B3 --list
+ASCEND_RT_VISIBLE_DEVICES=0 python -m benchmarks.ascend_prefix_pr1_suite --chip 910B3 \
+  --only environment --only bf16-burst --only bf16-paced
+```
+
+如果 B3 节点给你分配了多张卡，可以先选一张跑全量，再在其他空闲卡上按顺序复测服务基线。比如两张复测卡是 3 和 7 时，每张卡会生成各自的报告。
+
+```bash
+for card in 3 7; do
+  ASCEND_RT_VISIBLE_DEVICES="$card" python -m benchmarks.ascend_prefix_pr1_suite --chip 910B3 \
+    --only environment --only bf16-burst --only bf16-paced
+done
 ```
 
 ### 核对历史流量和最终候选提交
 
-`--reference-traffic` 指向同时含有 `burst/traffic.json` 和 `paced/traffic.json` 的旧结果根目录。每种流量在启动服务前核对对应归档中的 primers、文本、实际 token 摘要、到达时刻、输出长度和 KV 池大小。旧生成器在 paced 模式下使用同一个随机源生成请求和到达间隔，因此不同到达模式可形成不同文本。跨精度比较使用各自同名的归档。将 `PRIOR_RESULTS` 设置为此前夜跑的结果根目录。
+`--reference-traffic` 可指向本套件的完整结果目录，也兼容旧目录的 `{burst,paced}/traffic.json`。新目录取 `bf16-burst/traffic.json` 和 `bf16-paced/traffic.json`。要在 B3 复现一份已完成的 B4 负载，把这两份文件按原目录结构复制到 B3，设置 `B4_RESULTS` 为其父目录。每种流量在启动 HTTP 服务前核对对应归档中的 primer、文本、token 摘要、计划到达时刻、输出长度和 KV 池大小。burst 与 paced 各自使用对应的清单。
 
 ```bash
-python -m benchmarks.ascend_prefix_pr1_suite all \
-  --reference-traffic "$PRIOR_RESULTS"
+ASCEND_RT_VISIBLE_DEVICES=0 python -m benchmarks.ascend_prefix_pr1_suite all \
+  --chip 910B3 --reference-traffic "$B4_RESULTS"
 ```
 
 默认验证本测试工作树的已提交 HEAD。整理完 PR 1 后，在测试工作树里指定最终候选所在的本地仓库和已提交 ref，填入实际路径及 SHA。
@@ -45,7 +63,23 @@ python -m benchmarks.ascend_prefix_pr1_suite all \
 
 将 `PR1_REPO` 设置为候选仓库的路径，`PR1_SHA` 设置为该仓库中要验证的提交。入口对候选提交建立临时本地克隆，先运行候选自己的 pre-commit 和 NPU 回归，再放入指定测试提交的 benchmark 和额外测试。新 worker 从这个临时检出加载运行时。`review.json` 分别记录 `candidate` 与 `harness`。外部脚本版本不能代替候选提交号。本地未提交修改不会进入候选快照。
 
-两个位置分开执行时，在 CPU 机器运行 `python -m benchmarks.ascend_prefix_pr1_suite cpu`，在 910B4 上运行 `python -m benchmarks.ascend_prefix_pr1_suite npu`。把两个相同候选 SHA、相同测试 SHA 的报告一并附到 PR 中。部分运行只声明所选阶段。重跑用 `--only 阶段名` 生成新报告，保留原报告和失败记录。
+也可以只在 CPU 机器运行一次 `python -m benchmarks.ascend_prefix_pr1_suite cpu`，在各自机器选卡后分别运行 `npu --chip 910B3` 和 `npu --chip 910B4`。将这三份相同候选 SHA 和测试 SHA 的报告附到 PR。部分运行只声明所选阶段。重跑用 `--only 阶段名` 生成新报告，保留原报告和失败记录。
+
+### 生成两款卡的服务对照表
+
+将两端结果拷到能同时读取它们的机器上。`B3_RESULTS` 和 `B4_RESULTS` 分别指向运行输出目录。至少需要各自已完成的 `environment`、`bf16-burst` 和 `bf16-paced` 三个阶段。生成表格可在 CPU 上执行。
+
+```bash
+python -m benchmarks.ascend_prefix_pr1_compare "$B3_RESULTS" "$B4_RESULTS" > dual-chip.md
+```
+
+工具核对两端实际型号、候选及测试提交、unpacked 设置、模型文件指纹和两份服务流量清单。表中分别给出每张卡的软件版本、单次运行状态、各负载的输出分歧和卡内 off/main 的配对 TTFT 变化。未通过服务校验的负载保留问题计数，收益栏留空。两台可同时先跑，事后用此命令核对清单。需要运行前校验时，可复制流量归档。
+
+### 上游测试依据
+
+RLT 的昇腾提交移除了产品测试对特定型号名的断言，并在 packed prefill 改动中加入后端与调度回归。本套件沿用产品的能力检查，在实验报告中核对具体型号。[RLT 型号处理](https://github.com/InferMatrixLab/vllm-rlt/commit/3f0bb13b082f03febe71064e91754440d3896741) · [RLT packed prefill](https://github.com/InferMatrixLab/vllm-rlt/commit/756f7bf5d1b4ff2f9ac9e760d572de1c25bbcfe6)
+
+vLLM 的核心用例验证块复用和逐出。vLLM-Ascend 的双卡用例对共享长前缀、不同后缀的提示分别开关缓存，比对 greedy 输出。本项目在支持的单卡配置上采用同输入对照，并增加逐循环页检查、实际命中计数和独立 HTTP 混合负载。[vLLM 块级测试](https://github.com/vllm-project/vllm/blob/b26e0840134ea4b4c87c34bd5a0e0aa61397c638/tests/v1/core/test_prefix_caching.py#L3036) · [vLLM-Ascend 端到端测试](https://github.com/vllm-project/vllm-ascend/blob/ae9a697311b02421ca6cb09157f0414a5521a71a/tests/e2e/pull_request/two_card/test_prefix_caching.py)
 
 ## 全量运行覆盖
 

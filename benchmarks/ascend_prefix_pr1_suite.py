@@ -5,6 +5,7 @@ import csv
 import json
 import os
 import platform
+import re
 import shlex
 import subprocess
 import sys
@@ -23,6 +24,7 @@ DIAGNOSTICS = "benchmarks.ascend_prefix_pr1_diagnostics"
 MATRIX = "benchmarks.ascend_main_prefix_matrix"
 SERVICE = "benchmarks.ascend_main_prefix_service"
 COMBO = "benchmarks.ascend_main_prefix_combo"
+PROBE = "benchmarks/ascend_prefix_pr1_hardware.py"
 CPU = ("pre-commit", "config")
 NPU = (
     "environment",
@@ -64,6 +66,12 @@ class Stage:
 
 def git(repo, *args):
     return subprocess.check_output(["git", *args], cwd=repo, text=True).strip()
+
+
+def reference_manifest(root, name):
+    current = root / ("bf16-" + name) / "traffic.json"
+    historical = root / name / "traffic.json"
+    return historical if historical.is_file() and not current.is_file() else current
 
 
 def stage_commands(args, out):
@@ -144,7 +152,7 @@ def stage_commands(args, out):
             options.append("--observe-prefill")
         if args.reference_traffic:
             options.extend(
-                ["--reference-traffic", str(args.reference_traffic / name / "traffic.json")]
+                ["--reference-traffic", str(reference_manifest(args.reference_traffic, name))]
             )
         benchmark(track + "-" + name, SERVICE, options)
     benchmark(
@@ -226,10 +234,43 @@ def install_checks(checkout, tools_sha):
         (checkout / target).write_bytes(data)
 
 
+def check_hardware(checkout, env, out, tools_sha, model, expected):
+    selector = env.get("ASCEND_RT_VISIBLE_DEVICES")
+    if not selector or not model or not model.is_dir():
+        return {
+            "verification": "unavailable",
+            "detail": "requires local MODEL and assigned ASCEND_RT_VISIBLE_DEVICES",
+        }
+    if expected and not re.fullmatch("[0-9]+", selector):
+        return {
+            "verification": "unavailable",
+            "detail": "--chip requires one numeric ASCEND_RT_VISIBLE_DEVICES selector",
+        }
+    # Run the pinned probe outside the measured workers. Exiting this process
+    # releases its NPU context before any regression or timed workload starts.
+    code = subprocess.check_output(["git", "show", f"{tools_sha}:{PROBE}"], cwd=ROOT)
+    path = out / "hardware.json"
+    command = [sys.executable, "-", str(path)]
+    if expected:
+        command.append(expected)
+    with (out / "hardware.log").open("x") as log:
+        result = subprocess.run(
+            command, input=code, cwd=checkout, env=env, stdout=log, stderr=subprocess.STDOUT
+        )
+    if result.returncode < 0:
+        raise KeyboardInterrupt
+    if result.returncode:
+        return {
+            "verification": "unavailable",
+            "detail": f"NPU probe exited {result.returncode}; see hardware.log",
+        }
+    return json.loads(path.read_text())
+
+
 def snapshot(out, report):
     # Write after each stage. An interrupted run keeps the remaining NOT_RUN rows.
     statuses = {r["status"] for r in report["stages"].values()}
-    if statuses == {"PASS"}:
+    if statuses == {"PASS"} and report.get("hardware", {}).get("verification") != "unverified":
         status = "PASS"
     elif "FAIL" in statuses:
         status = "FAIL"
@@ -253,6 +294,28 @@ def markdown_report(out, report):
         f"- 测试工具 `{report['harness']}`",
         "",
     ]
+    if evidence := report.get("hardware"):
+        lines.append(
+            f"目标型号 `{report['expected_chip'] or '自动识别'}`，"
+            f"运行时设备名 `{evidence.get('runtime_device_name', '未取得')}`，"
+            f"型号核对 `{evidence['verification']}`。"
+        )
+        if "device_memory_bytes" in evidence:
+            gib = 1024**3
+            total = evidence["device_memory_bytes"]
+            hbm = f"{total / gib:.2f} GiB" if total is not None else "未取得"
+            lines.append(
+                f"ASCEND_RT_VISIBLE_DEVICES=`{report['assigned_device']}`，逻辑卡 "
+                f"`npu:{evidence['logical_device']}`，可见卡数 {evidence['visible_device_count']}，"
+                f"单卡 HBM {hbm}，"
+                f"操作系统可见物理内存 {evidence['os_physical_memory_bytes'] / gib:.2f} GiB。"
+                " [设备记录](hardware.json)"
+            )
+        if detail := evidence.get("detail"):
+            lines.append(detail)
+        if (out / "hardware.log").is_file():
+            lines.append("[设备探测日志](hardware.log)")
+        lines.append("")
     environment = out / "environment" / "environment.json"
     if environment.exists():
         data = json.loads(environment.read_text())
@@ -344,9 +407,14 @@ def main(argv=None):
         "--candidate", default="HEAD", help="Committed candidate ref in --repo (default HEAD)"
     )
     p.add_argument(
+        "--chip",
+        choices=("910B3", "910B4"),
+        help="Verify the runtime SKU of the assigned single card for this run",
+    )
+    p.add_argument(
         "--reference-traffic",
         type=Path,
-        help="Prior results root with burst/traffic.json and paced/traffic.json",
+        help="Prior results root with {bf16-burst,bf16-paced} or legacy {burst,paced} manifests",
     )
     p.add_argument(
         "--unpacked",
@@ -371,7 +439,11 @@ def main(argv=None):
     if args.reference_traffic:
         args.reference_traffic = args.reference_traffic.resolve()
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    out = (args.out or (Path.cwd() / "results" / f"ascend-prefix-pr1-{stamp}")).resolve()
+    selector = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "")
+    suffix = f"-{args.chip}" if args.chip else ""
+    if args.chip and re.fullmatch("[0-9]+", selector):
+        suffix += f"-card{selector}"
+    out = (args.out or (Path.cwd() / "results" / f"ascend-prefix-pr1{suffix}-{stamp}")).resolve()
     stages = stage_commands(args, out)
     if args.list:
         for name in names:
@@ -396,6 +468,7 @@ def main(argv=None):
         platform=platform.platform(),
         model=str(args.model) if args.model else None,
         assigned_device=env.get("ASCEND_RT_VISIBLE_DEVICES"),
+        expected_chip=args.chip,
         unpacked_policy=args.unpacked,
         full_pr1_scope=selected == set(CPU + NPU),
         stages={n: {"status": "NOT_RUN"} for n in names},
@@ -423,17 +496,20 @@ def main(argv=None):
             env["PYTHONPATH"] = os.pathsep.join(
                 filter(None, (str(checkout), env.get("PYTHONPATH")))
             )
+            hardware = {}
+            if selected.difference(CPU):
+                hardware = check_hardware(checkout, env, out, tools_sha, args.model, args.chip)
+                report["hardware"] = hardware
+                detail = hardware.get("detail") or hardware["runtime_device_name"]
+                print(f"[hardware] {hardware['verification']}  {detail}", flush=True)
+                snapshot(out, report)
             # Keep hardware setup paths, but resolve all runtime modules from the candidate.
             installed = False
             for name in names:
-                if name not in CPU and (
-                    not args.model
-                    or not args.model.is_dir()
-                    or not env.get("ASCEND_RT_VISIBLE_DEVICES")
-                ):
+                if name not in CPU and hardware["verification"] in ("unavailable", "mismatch"):
                     report["stages"][name] = {
                         "status": "INCOMPLETE",
-                        "detail": "requires local MODEL and assigned ASCEND_RT_VISIBLE_DEVICES",
+                        "detail": hardware["detail"],
                     }
                 else:
                     # Test-only files are installed after checking the unmodified candidate.
@@ -449,7 +525,9 @@ def main(argv=None):
     status = snapshot(out, report)
     markdown_report(out, report)
     print(f"{status}  {out / 'PR_RESULTS.md'}", flush=True)
-    if any(r["status"] in ("INCOMPLETE", "NOT_RUN") for r in report["stages"].values()):
+    if status == "INCOMPLETE" or any(
+        r["status"] in ("INCOMPLETE", "NOT_RUN") for r in report["stages"].values()
+    ):
         return 2
     return 0 if status == "PASS" else 1
 
