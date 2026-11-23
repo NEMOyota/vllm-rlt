@@ -5,6 +5,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from benchmarks import ascend_main_prefix_combo as combo
 from benchmarks import ascend_main_prefix_service as service
@@ -14,7 +15,10 @@ from benchmarks.ascend_prefix_opportunities import opportunities
 from tests.test_ascend_main_prefix_experiments import cpu_model  # noqa: F401
 
 
-def test_tiny_ouro_all_six_workloads(tmp_path, monkeypatch, cpu_model):  # noqa: F811
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+def test_tiny_ouro_all_six_workloads(tmp_path, monkeypatch, cpu_model, dtype):  # noqa: F811
+    monkeypatch.setenv("RLT_BENCH_DTYPE", dtype)
+    cpu_model.to(getattr(torch, dtype))
     # The fixture uses the real scheduler and packed KV on CPU. Substitute the
     # NPU-only backend selection, then exercise the actual production kernel.
     build = combo.open_engine
@@ -29,7 +33,7 @@ def test_tiny_ouro_all_six_workloads(tmp_path, monkeypatch, cpu_model):  # noqa:
     try:
         result = pr2.evaluate(
             cpu_model,
-            SimpleNamespace(linear_fp32_chunk=None, case=None, profile=False, repeats=1),
+            SimpleNamespace(linear_fp32_chunk=None, case=None, profile=False, warmups=0, repeats=1),
             report,
         )
     finally:
