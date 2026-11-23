@@ -133,6 +133,7 @@ def trial(model, case, mode, arm, inputs, *, linear_work=None):
         )
         origins = {s.request.request_id: s.request.prefill_window_origin for s in schedule.requests}
         actual = {s.request.request_id: s.token_start for s in schedule.requests}
+        prefill_rows = {s.request.request_id: s.token_count for s in schedule.requests}
         require(
             origins == actual == starts, f"hit tokens {origins}, starts {actual}, expected {starts}"
         )
@@ -169,6 +170,7 @@ def trial(model, case, mode, arm, inputs, *, linear_work=None):
                 ttft_ms=1000 * (first[rid] - submitted[rid]),
                 e2e_ms=1000 * (t - submitted[rid]),
                 hit_tokens=origins[rid],
+                prefill_rows=prefill_rows[rid],
             )
         work_stats = {}
         if linear_work is not None:

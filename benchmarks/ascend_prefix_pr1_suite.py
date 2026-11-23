@@ -45,6 +45,7 @@ NPU = (
     "profile",
 )
 GROUPING = ("grouped-matrix", "grouped-burst", "grouped-paced", "observe-burst", "observe-paced")
+B4_REPRO = ("b4-cases-bf16", "b4-cases-fp32")
 HARNESS = (
     "benchmarks/ascend_main_prefix_combo.py",
     "benchmarks/ascend_main_prefix_linear.py",
@@ -167,6 +168,8 @@ def stage_commands(args, out):
     )
     benchmark("grouped-matrix", MATRIX, ["bf16", "--repeats", "3"])
     benchmark("drift", DIAGNOSTICS, ["drift", "--matrix", str(out / "bf16-matrix" / "review.json")])
+    benchmark("b4-cases-bf16", DIAGNOSTICS, ["drift"])
+    benchmark("b4-cases-fp32", DIAGNOSTICS, ["drift", "--linear-fp32-chunk", "256"])
     benchmark("profile", DIAGNOSTICS, ["profile"])
     return {stage.name: stage for stage in stages}
 
@@ -333,6 +336,30 @@ def markdown_report(out, report):
             sources.append(f"[数据]({row['artifact']})")
         lines.append(f"| {name} | {row['status']} | {' · '.join(sources)} |")
 
+    drift_rows = []
+    for name in B4_REPRO:
+        evidence = report["stages"].get(name, {}).get("evidence", {})
+        for case, row in evidence.get("results", {}).items():
+            counts = [
+                f"{row[pair]} / {row['requests']}" if pair in row else "—"
+                for pair in ("off_vs_miss", "off_vs_reuse")
+            ]
+            drift_rows.append(
+                f"| {evidence['precision']} | [{case}]({name}/{case}.json) | "
+                f"{counts[0]} | {counts[1]} | {row['status']} |"
+            )
+    if drift_rows:
+        lines += [
+            "",
+            "## 910B4 历史分歧场景的同精度对照",
+            "",
+            "每格为输出 token 有分歧的请求数 / 目标请求总数。位置从 1 起计。",
+            "",
+            "| 精度 | 场景与逐请求记录 | off 对 miss | off 对 reuse | 状态 |",
+            "|---|---|---:|---:|---|",
+            *drift_rows,
+        ]
+
     for name in ("bf16-matrix", "fp32-matrix"):
         evidence = report["stages"].get(name, {}).get("evidence", {})
         if "cases" in evidence:
@@ -443,7 +470,7 @@ def main(argv=None):
     p.add_argument(
         "--only",
         action="append",
-        choices=(*CPU, *NPU, *GROUPING),
+        choices=(*CPU, *NPU, *GROUPING, *B4_REPRO),
         help="Run a named stage; repeat to select multiple stages",
     )
     p.add_argument(
@@ -483,7 +510,15 @@ def main(argv=None):
     chosen = args.only or {"cpu": CPU, "npu": NPU, "all": CPU + NPU, "pr2": GROUPING}[args.scope]
     selected = set(chosen)
     # Checks of the untouched candidate precede installation of the harness.
-    order = ["pre-commit", "npu-regression", "environment", *CPU[1:], *NPU[2:], *GROUPING]
+    order = [
+        "pre-commit",
+        "npu-regression",
+        "environment",
+        *CPU[1:],
+        *NPU[2:],
+        *GROUPING,
+        *B4_REPRO,
+    ]
     names = [name for name in order if name in selected]
     if args.model:
         args.model = args.model.expanduser().resolve()

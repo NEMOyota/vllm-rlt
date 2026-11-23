@@ -1,4 +1,4 @@
-"""Separate numerical and device-profile replays of the native BF16 PR1 path."""
+"""Numerical replay of PR1 cache arms and device profiles of native BF16."""
 
 import argparse
 import csv
@@ -7,6 +7,7 @@ import json
 import platform
 import shutil
 import subprocess
+import traceback
 from collections import Counter, defaultdict
 from contextlib import nullcontext
 from pathlib import Path
@@ -16,6 +17,11 @@ import torch
 
 from benchmarks import ascend_main_prefix_combo as combo
 from benchmarks import ascend_main_prefix_matrix as matrix
+from benchmarks.ascend_main_prefix_linear import (
+    add_precision_arg,
+    padded_fp32_linears,
+    precision_settings,
+)
 from benchmarks.ascend_main_prefix_results import ids_digest
 from benchmarks.ascend_prefix_combo_checks import require
 from benchmarks.preemption import checkpoint_identity
@@ -32,7 +38,7 @@ def save(path, data):
     path.write_text(json.dumps(data, indent=2, allow_nan=False) + "\n")
 
 
-def trace_logits(model, case, inputs, arm):
+def trace_logits(model, case, inputs, arm, *, linear_work=None):
     """Bind LM-head rows to the actual CODA spans in this synchronous replay only."""
     records = defaultdict(list)
     execute = ModelRunner._execute_batch
@@ -55,10 +61,19 @@ def trace_logits(model, case, inputs, arm):
             return execute(runner, batch, prepared)
 
     with patch.object(ModelRunner, "_execute_batch", observed):
-        result = matrix.trial(model, case, "main", arm, inputs)
+        result = matrix.trial(model, case, "main", arm, inputs, linear_work=linear_work)
     for rid, row in result["requests"].items():
-        selected = [int(scores.argmax()) for _, scores in records[rid]]
-        require(selected == row["tokens"], f"logits do not match returned IDs for {rid}")
+        require(
+            row["prefill_rows"] == len(inputs[2][rid]) - row["hit_tokens"],
+            f"{arm} {rid}: first prefill did not cover the expected suffix",
+        )
+        # A device can select a different tied maximum from a CPU argmax. Use
+        # the device's returned IDs for parity and its captured scores as evidence.
+        steps = zip(records[rid], row["tokens"], strict=True)
+        require(
+            all(scores[token] == scores.max() for (_, scores), token in steps),
+            f"{arm} {rid}: captured logits do not support the returned greedy ID",
+        )
     return result, records
 
 
@@ -72,13 +87,15 @@ def margin(scores, tokens):
     )
 
 
-def diagnose_case(model, name):
+def diagnose_case(model, name, *, linear_work=None):
     case = matrix.FULL[name]
     inputs = combo.workload(case, model.config.vocab_size)
-    baseline, reference = trace_logits(model, case, inputs, "off")
+    baseline, reference = trace_logits(model, case, inputs, "off", linear_work=linear_work)
+    trials = {"off": baseline}
     differences = []
     for arm in ("miss", "reuse"):
-        current, observed = trace_logits(model, case, inputs, arm)
+        current, observed = trace_logits(model, case, inputs, arm, linear_work=linear_work)
+        trials[arm] = current
         for diff in combo.token_diffs(baseline, current, f"off_vs_{arm}"):
             rid, pos = diff["request"], diff["first_diff_1based"] - 1
             history = baseline["requests"][rid]["tokens"][:pos]
@@ -87,7 +104,7 @@ def diagnose_case(model, name):
             right_hidden, right_scores = observed[rid][pos]
             tokens = [diff["expected"], diff["actual"]]
             # Independent dot products for just the two selected tokens and both
-            # native hidden rows. This isolates the head, not all upstream layers.
+            # observed hidden rows. This isolates the head, not all upstream layers.
             head = model.lm_head
             idx = torch.tensor(tokens, device=head.weight.device)
             weights = head.weight.index_select(0, idx).detach().cpu().double()
@@ -109,7 +126,56 @@ def diagnose_case(model, name):
                     candidate_head_fp64_pair=(weights @ right_hidden.double() + bias).tolist(),
                 )
             )
-    return dict(case=name, differences=differences)
+    arms = {}
+    for arm, trial in trials.items():
+        requests = {}
+        for rid, row in trial["requests"].items():
+            requests[rid] = {key: row[key] for key in ("hit_tokens", "prefill_rows", "tokens")}
+        arms[arm] = {"requests": requests}
+        if linear_work is not None:
+            arms[arm]["linear_work"] = trial["linear_work"]
+    return dict(
+        case=name,
+        primer_ids={"off_and_reuse": inputs[0], "miss": inputs[1]},
+        target_prompt_ids=inputs[2],
+        arms=arms,
+        differences=differences,
+    )
+
+
+def run_drift(model, names, out, chunk):
+    names = list(dict.fromkeys(names))
+    settings = precision_settings(chunk)
+    results = {}
+    count = 0
+    with padded_fp32_linears(model, chunk) as work:
+        for name in names:
+            try:
+                row = diagnose_case(model, name, linear_work=work)
+            except (AssertionError, ValueError, RuntimeError) as exc:
+                traceback.print_exc()
+                summary = dict(status="INCOMPLETE", detail=f"{type(exc).__name__}: {exc}")
+                row = {"case": name}
+            else:
+                diffs = row["differences"]
+                count += len(diffs)
+                by_pair = Counter(diff["comparison"] for diff in diffs)
+                summary = dict(
+                    status="FAIL" if diffs else "PASS",
+                    requests=len(row["target_prompt_ids"]),
+                    off_vs_miss=by_pair["off_vs_miss"],
+                    off_vs_reuse=by_pair["off_vs_reuse"],
+                )
+            results[name] = summary
+            save(out / f"{name}.json", {**settings, **row, **summary})
+            print(name, summary, flush=True)
+    incomplete = any(row["status"] == "INCOMPLETE" for row in results.values())
+    status = "INCOMPLETE" if incomplete else "FAIL" if count else "PASS"
+    save(
+        out / "review.json",
+        dict(**settings, cases=names, results=results, differences=count, status=status),
+    )
+    return {"INCOMPLETE": 2, "FAIL": 1, "PASS": 0}[status]
 
 
 def checked_profile_files(folder, full):
@@ -227,7 +293,10 @@ def main():
     p.add_argument("--out", required=True, type=Path)
     p.add_argument("--matrix", type=Path, help="Also diagnose failures found by this BF16 matrix")
     p.add_argument("--case", choices=matrix.FULL, action="append")
+    add_precision_arg(p)
     args = p.parse_args()
+    if args.linear_fp32_chunk is not None and args.task != "drift":
+        p.error("--linear-fp32-chunk applies to drift replays")
     args.out.mkdir(parents=True, exist_ok=False)
     device = resolve_device("npu:0")
     torch.npu.set_device(device)
@@ -236,6 +305,7 @@ def main():
         python=platform.python_version(),
         system=platform.platform(),
         allow_hf32=getattr(getattr(torch.npu, "matmul", None), "allow_hf32", None),
+        **precision_settings(args.linear_fp32_chunk),
     )
     save(args.out / "environment.json", env)
     if args.task == "env":
@@ -259,13 +329,7 @@ def main():
         names = list(args.case or KNOWN)
         if args.matrix and args.matrix.is_file():
             names.extend(json.loads(args.matrix.read_text()).get("failed", []))
-        count = 0
-        for name in dict.fromkeys(names):
-            row = diagnose_case(model, name)
-            save(args.out / f"{name}.json", row)
-            count += len(row["differences"])
-        save(args.out / "review.json", dict(cases=list(dict.fromkeys(names)), differences=count))
-        return int(count > 0)
+        return run_drift(model, names, args.out, args.linear_fp32_chunk)
 
     name = (args.case or ["p512_s8"])[0]
     case = matrix.FULL[name]
