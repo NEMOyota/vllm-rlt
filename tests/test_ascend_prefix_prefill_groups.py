@@ -179,6 +179,15 @@ def test_grouped_sdpa_matches_independent_dense_oracle(
         assert kernel.layout_reuses > 0
 
 
+def test_lone_cached_suffix_skips_group_planning(monkeypatch):
+    batch, q, kv, expected = make_batch([(0, 48, 23)], torch.device("cpu"), torch.float32, 5)
+    monkeypatch.setattr(ascend, "partition", lambda *a, **kw: pytest.fail("no second request"))
+    kernel = ascend.AscendAttention(prefix_prefill_slack=4)
+    torch.testing.assert_close(
+        kernel.attend_metadata(q, kv[0, :, 1], kv[1, :, 1], batch), expected, atol=2e-6, rtol=2e-6
+    )
+
+
 def test_no_grouping_on_per_row_tables_or_nonflat_cache_and_ignore_trailing_queries():
     shapes = [(0, 48, 23), (0, 48, 20)]
     batch, q, kv, expected = make_batch(shapes, torch.device("cpu"), torch.float32, 44)

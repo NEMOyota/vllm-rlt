@@ -347,6 +347,7 @@ class AscendAttention:
                 and packed
                 and flat_rows is not None
                 and self._geometry is None
+                and batch.block_tables.shape[0] > 1
             ):
                 self._groups = self._plan_prefix(q, keys, batch, flat_rows, stream)
             elif flat_rows is None or self._geometry is None:
