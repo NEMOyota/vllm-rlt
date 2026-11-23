@@ -135,6 +135,7 @@ def test_service_checks_real_hits_and_generated_ids_independently_of_text():
         backend="ascend_eager",
         packed=True,
         dtype="torch.bfloat16",
+        value_cache_dtype="torch.bfloat16",
         linear_weight_dtypes=["torch.bfloat16"],
         multi_stream=False,
         async_scheduling=False,
@@ -155,14 +156,18 @@ def test_service_checks_real_hits_and_generated_ids_independently_of_text():
     assert len(issues) == 2
 
 
-def test_inherited_bf16_drift_retains_trials_and_excludes_benefit(tmp_path, monkeypatch):
+@pytest.mark.parametrize("first_bad_round", [1, 3])
+def test_inherited_bf16_drift_retains_trials_and_excludes_benefit(
+    tmp_path, monkeypatch, first_bad_round
+):
     import json
     from types import SimpleNamespace
 
     from benchmarks.ascend_main_prefix_results import Report
 
     def inject(model, case, mode, arm, inputs, *, linear_work=None):
-        seq = [1] * 16 if arm != "reuse" else [2] * 16
+        changed = arm == "reuse" and report.location["round"] >= first_bad_round
+        seq = [2 if changed else 1] * 16
         return dict(
             requests={
                 "target-0": dict(
@@ -176,7 +181,7 @@ def test_inherited_bf16_drift_retains_trials_and_excludes_benefit(tmp_path, monk
     report = Report("BENEFIT", tmp_path / "run")
     try:
         code = matrix.run_cases(
-            SimpleNamespace(experiment="benefit", warmups=0, repeats=1),
+            SimpleNamespace(experiment="benefit", warmups=0, repeats=3, correctness_rounds=2),
             SimpleNamespace(config=SimpleNamespace(vocab_size=64)),
             report,
             ["p128_s8"],
@@ -185,12 +190,15 @@ def test_inherited_bf16_drift_retains_trials_and_excludes_benefit(tmp_path, monk
         report.stream.close()
     assert code == 1
     review = json.loads((report.folder / "review.json").read_text())
-    assert set(review["failed_comparisons"]) == {
+    assert set(review["failed_comparisons"]) >= {
         "main.off_vs_main.reuse",
         "grouped.off_vs_grouped.reuse",
     }
     entries = [json.loads(line) for line in (report.folder / "raw.jsonl").read_text().splitlines()]
-    assert len([r for r in entries if r["kind"] == "TRIAL"]) == 6
+    assert len([r for r in entries if r["kind"] == "TRIAL"]) == 18
+    case = next(r for r in entries if r["kind"] == "BENEFIT_CASE")
+    assert case["correctness_status"] == ("FAIL" if first_bad_round == 1 else "PASS")
+    assert case["performance_valid"] is False
     assert next(r for r in entries if r["kind"] == "CASE_DETAILS")["paired_ttft"] == {}
 
 
@@ -213,6 +221,7 @@ def test_service_checks_the_requested_linear_precision_even_with_cache_off():
         backend="ascend_eager",
         packed=True,
         dtype="torch.bfloat16",
+        value_cache_dtype="torch.bfloat16",
         linear_weight_dtypes=["torch.bfloat16"],
         multi_stream=False,
         async_scheduling=False,
