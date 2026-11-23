@@ -58,21 +58,23 @@ def test_shared_page_oracle_on_cpu():
 
 
 @pytest.fixture
-def cpu_packed_model(monkeypatch):
+def cpu_packed_model(monkeypatch, request):
     # Enable the real packed host descriptors and range algorithm on CPU.
     # The server entry point itself always requires torch-npu.
     build = combo.open_engine
     monkeypatch.setattr(stage_engine, "packed_prefill_eligible", lambda *a, **kw: True)
     monkeypatch.setattr(stage_engine, "create_backend", lambda *a, **kw: cpu_attention())
 
-    def host_engine(*args):
-        engine = build(*args)
+    def host_engine(*args, **kwargs):
+        engine = build(*args, **kwargs)
         engine.cache_manager._prepared_coverage = WeakKeyDictionary()
         return engine
 
     monkeypatch.setattr(combo, "open_engine", host_engine)
     torch.manual_seed(168)
-    return OuroForCausalLM(tiny_ouro_config()).to(torch.bfloat16).eval()
+    return (
+        OuroForCausalLM(tiny_ouro_config(**getattr(request, "param", {}))).to(torch.bfloat16).eval()
+    )
 
 
 def test_three_arms_through_cpu_runner(cpu_packed_model):

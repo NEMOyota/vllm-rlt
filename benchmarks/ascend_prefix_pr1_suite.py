@@ -24,6 +24,7 @@ DIAGNOSTICS = "benchmarks.ascend_prefix_pr1_diagnostics"
 MATRIX = "benchmarks.ascend_main_prefix_matrix"
 SERVICE = "benchmarks.ascend_main_prefix_service"
 COMBO = "benchmarks.ascend_main_prefix_combo"
+REPLAY = "benchmarks.ascend_prefix_pr1_replay"
 PROBE = "benchmarks/ascend_prefix_pr1_hardware.py"
 CPU = ("pre-commit", "config")
 NPU = (
@@ -31,8 +32,10 @@ NPU = (
     "npu-regression",
     "npu-contract",
     "stock-http",
+    "bf16-replay",
     "bf16-combo",
     "bf16-matrix",
+    "fp32-replay",
     "fp32-combo",
     "fp32-matrix",
     "bf16-burst",
@@ -52,6 +55,7 @@ HARNESS = (
     "benchmarks/ascend_main_prefix_service.py",
     "benchmarks/ascend_main_prefix_service_worker.py",
     "benchmarks/ascend_prefix_pr1_diagnostics.py",
+    "benchmarks/ascend_prefix_pr1_replay.py",
     "benchmarks/ascend_prefix_opportunities.py",
     CONTRACT,
 )
@@ -122,6 +126,7 @@ def stage_commands(args, out):
     benchmark("environment", DIAGNOSTICS, ["env"])
     for precision in ("bf16", "fp32"):
         chunk = ["--linear-fp32-chunk", "256"] if precision == "fp32" else []
+        benchmark(precision + "-replay", REPLAY, chunk)
         benchmark(precision + "-combo", COMBO, ["--repeats", "2", *chunk])
         benchmark(
             precision + "-matrix", MATRIX, [precision, "--main-only", "--repeats", "3", *chunk]
@@ -339,6 +344,52 @@ def markdown_report(out, report):
                     f"{len(failed)} 个失败。{'、'.join(failed)}",
                 ]
             )
+    for name in ("bf16-replay", "fp32-replay"):
+        evidence = report["stages"].get(name, {}).get("evidence", {})
+        cases = evidence.get("cases", {})
+        if not cases:
+            continue
+        lines.extend(
+            [
+                "",
+                f"## {name}",
+                "",
+                "| 场景 | 缓存 | 请求 | 预期 / 实际命中 token | 实际 prefill 区间 | "
+                "结束时活跃页 | 控制检查 |",
+                "|---|---|---|---|---|---:|---|",
+            ]
+        )
+        for case, result in cases.items():
+            for mode, rows in result["runs"].items():
+                for request in ("cold", "repeat", "branch"):
+                    row = rows.get(request, {})
+                    spans = " ".join(f"[{a},{b})" for a, b in row.get("prefill_spans", []))
+                    controls = ", ".join(row.get("controls_failed", [])) or (
+                        "PASS" if row else "未执行"
+                    )
+                    lines.append(
+                        f"| {case} | {mode} | {request} | {row.get('expected_hit_tokens', '—')} / "
+                        f"{row.get('hit_tokens', '—')} | {spans or '—'} | "
+                        f"{row.get('live_blocks_after', '—')} | {controls} |"
+                    )
+        lines.append("")
+        comparisons = {case: result["token_comparisons"] for case, result in cases.items()}
+        if evidence.get("budget_comparisons"):
+            comparisons["整段与分步（预算诊断）"] = evidence["budget_comparisons"]
+        for case, checks in comparisons.items():
+            matches = sum(check["status"] == "PASS" for check in checks)
+            missing = sum(check["status"] == "NOT_RUN" for check in checks)
+            lines.append(
+                f"- {case} 共 {len(checks)} 项逐 token 对照，{matches} 项一致，{missing} 项未执行。"
+            )
+            for diff in checks:
+                if diff["status"] == "FAIL":
+                    lines.append(
+                        f"  - {diff['reference']} 与 {diff['actual']} 在第 "
+                        f"{diff['first_diff_1based']} 个输出 token 首次不同，"
+                        f"ID 为 {diff['expected_id']} / {diff['actual_id']}。"
+                    )
+        lines.extend(["", f"[逐 token、退出深度和分步 attention 审计]({name}/review.json)"])
     fields = (
         "round",
         "mode",

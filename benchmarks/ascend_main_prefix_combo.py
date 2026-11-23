@@ -114,8 +114,10 @@ def prompts(case, vocab):
     return donor, miss, targets
 
 
-def open_engine(model, case, arm):
+def open_engine(model, case, arm, *, token_budget=None):
     capacity = case.prefix + case.suffix + OUTPUTS - 1
+    if token_budget is None:
+        token_budget = case.count * capacity
     blocks = 4 * math.ceil(capacity / BLOCK) * (case.count if case.tight_pool else case.count + 1)
     return StageEngine(
         model,
@@ -126,7 +128,7 @@ def open_engine(model, case, arm):
         scheduler_config=SchedulerConfig(
             max_num_seqs=case.count,
             prefill_chunk_size=capacity,
-            max_num_batched_tokens=case.count * capacity,
+            max_num_batched_tokens=token_budget,
         ),
         execution_config=ExecutionConfig(multi_stream=False, use_uva=False),
     )

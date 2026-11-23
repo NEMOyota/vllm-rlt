@@ -45,6 +45,27 @@ for card in 3 7; do
 done
 ```
 
+### 先跑冷请求、完整重复与分支后缀
+
+下面两行分别在对应服务器执行，沿用上面设置的 `MODEL`，把 0 换成已分配的单卡编号。这组检查也已纳入 `all` 和 `npu`。要同时跑固定行 FP32 线性层参照，在同一命令再加 `--only fp32-replay`。
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0 python -m benchmarks.ascend_prefix_pr1_suite --chip 910B3 --only bf16-replay
+ASCEND_RT_VISIBLE_DEVICES=0 python -m benchmarks.ascend_prefix_pr1_suite --chip 910B4 --only bf16-replay
+```
+
+每个场景使用两个初始缓存为空的引擎。一个关闭缓存，一个开启缓存。两边都依次执行同一条冷请求、完整重复、共享前缀后更换末尾的分支。三条请求各自生成 16 个 token，逐条等到结束再提交下一条。输入来自本地 Ouro 分词器编码的固定英文段落，分支在 token 序列上构造。16-token 页只复用完整页，完整重复时仍要重算末尾以取得输出头需要的隐藏状态。
+
+| 场景 | 输入 token | 分支的第一个不同位置（从 0 计） | 每步 token 预算 | 开缓存时冷 / 重复 / 分支的预期命中 |
+|---|---:|---:|---:|---|
+| short_full | 71 | 48 | 71 | 0 / 64 / 48 |
+| short_split | 71 | 48 | 16 | 0 / 64 / 48 |
+| long_full | 1100 | 1068 | 1100 | 0 / 1088 / 1056 |
+
+`short_full` 和 `short_split` 共用输入。分步场景的热分支必须按 `[48,64)`、`[64,71)` 执行，attention 的 Q/KV 长度依次为 16/64、7/71。该分支在缓存开、关两边的每个 prefill 步都审计 packed 页表、绝对位置因果掩码和四个循环各层的连续写入区间。长场景的分叉落在页内，第 1056 到 1067 位这 12 个相同 token 也需要重算。
+
+每个场景都以同一预算和精度比较三条请求各自的开关输出，另比对每个引擎内冷请求与完整重复的输出。`PR_RESULTS.md` 展示命中量、调度区间、活跃页和逐 token 对照结果。`{bf16,fp32}-replay/review.json` 保留完整输出、退出深度、首处分歧的位置和双方 token ID。另列的六项 `budget_comparisons` 比较相同请求在整段与分步下的输出，便于核对关闭缓存时是否也受计算形状影响。这六项是预算诊断，缓存一致性按同一预算验收。请求结束时活跃页须归零，共享页可由前缀索引保留。TTFT 和吞吐取 `bf16-benefit`、`bf16-burst` 和 `bf16-paced` 的独立测量。
+
 ### 核对历史流量和最终候选提交
 
 `--reference-traffic` 可指向本套件的完整结果目录，也兼容旧目录的 `{burst,paced}/traffic.json`。新目录取 `bf16-burst/traffic.json` 和 `bf16-paced/traffic.json`。要在 B3 复现一份已完成的 B4 负载，把这两份文件按原目录结构复制到 B3，设置 `B4_RESULTS` 为其父目录。每种流量在启动 HTTP 服务前核对对应归档中的 primer、文本、token 摘要、计划到达时刻、输出长度和 KV 池大小。burst 与 paced 各自使用对应的清单。
@@ -79,6 +100,8 @@ python -m benchmarks.ascend_prefix_pr1_compare "$B3_RESULTS" "$B4_RESULTS" > dua
 
 RLT 的昇腾提交移除了产品测试对特定型号名的断言，并在 packed prefill 改动中加入后端与调度回归。本套件沿用产品的能力检查，在实验报告中核对具体型号。[RLT 型号处理](https://github.com/InferMatrixLab/vllm-rlt/commit/3f0bb13b082f03febe71064e91754440d3896741) · [RLT packed prefill](https://github.com/InferMatrixLab/vllm-rlt/commit/756f7bf5d1b4ff2f9ac9e760d572de1c25bbcfe6)
 
+RLT 的 Dory PR 用真权重运行 cold、hit、branch，并给分支保留自己的 cache-off 输出作对照。这里把这套验收方法用于 Ouro 的同步单卡路径，并记录每一步的调度区间。[Dory PR #190](https://github.com/InferMatrixLab/vllm-rlt/pull/190)
+
 vLLM 的核心用例验证块复用和逐出。vLLM-Ascend 的双卡用例对共享长前缀、不同后缀的提示分别开关缓存，比对 greedy 输出。本项目在支持的单卡配置上采用同输入对照，并增加逐循环页检查、实际命中计数和独立 HTTP 混合负载。[vLLM 块级测试](https://github.com/vllm-project/vllm/blob/b26e0840134ea4b4c87c34bd5a0e0aa61397c638/tests/v1/core/test_prefix_caching.py#L3036) · [vLLM-Ascend 端到端测试](https://github.com/vllm-project/vllm-ascend/blob/ae9a697311b02421ca6cb09157f0414a5521a71a/tests/e2e/pull_request/two_card/test_prefix_caching.py)
 
 ## 全量运行覆盖
@@ -89,6 +112,7 @@ vLLM 的核心用例验证块复用和逐出。vLLM-Ascend 的双卡用例对共
 | `npu-regression`、`npu-contract` | 收集候选仓库全部 `npu` 标记用例，两个新增入口单列。以 BF16 真权重比较冷跑与缓存复用，检查实际命中 0/16 token、取消后共享页复用、请求 ID 重用、结束原因、退出深度、活跃页释放与不支持的采样参数。对显式关闭 packed 的路径也执行检查。 | 三类 pytest 阶段分别保存 XML 和日志。硬件测试意外跳过记为 INCOMPLETE |
 | `stock-http` | 通过 `python -m vllm_rlt.entrypoints.serve --enable-prefix-caching` 启动正式服务。先执行 donor，随后发两条共享长前缀、不同后缀的请求，检查普通完成、SSE、usage、断连后的服务和正常退出。正式接口返回文本和 usage。逐请求命中来自下方独立的 worker 审计。 | `upstream-http/ascend_eager-sync-prefix/` |
 | `environment` | 记录实际芯片、可见卡、CANN、Torch、torch-npu、Python、HF32 设置及权重/配置/分词器文件指纹。可用时保存 npu-smi 输出。 | `environment/` |
+| `bf16-replay`、`fp32-replay` | 冷请求、完整重复、分支后缀三路回放。三种长度与预算组合各跑缓存开、关，检查逐请求命中、逐步 prefill、16 个输出 token、退出深度、结束原因和页释放。 | `review.json`、逐请求的 `raw.jsonl` |
 | `bf16-combo`、`fp32-combo` | 页级 oracle 逐层、逐循环检查发布缺口、共享地址、私有后缀隔离、共享 KV 内容和绝对位置因果掩码。9 个引擎场景各跑 2 轮。 | 对应 `.jsonl` 的 ORACLE、CONTROL、CASE、REVIEW |
 | `bf16-matrix`、`fp32-matrix` | 同一组 30 例，3 轮。主线路径分别执行 off、miss、reuse。覆盖页边界、整段重复、冷热并发、驻留、紧池逐出。逐请求检查 16 个生成 token、固定退出深度、结束原因、实际命中、同模式重复运行。FP32 参照仅替换线性层，固定 256 行，KV/SDPA 仍为 BF16。 | `cases.csv`、`review.json.failed_comparisons`、`raw.jsonl` |
 | `bf16-burst`、`bf16-paced` | 原生 BF16，真实流式 HTTP 和独立模型 worker。32 条目标请求，冷热及长短混合，客户端并发上限 4，seed 168，每模式 2 轮。burst 突发，paced 平均 3 请求/秒。每轮新服务、相同 primer，off/main 第二轮逆序。核查 worker 的线性层权重与 KV dtype、chunk 设置、backend、packing、同步单流、逐请求命中与输出。 | `traffic.json`、各轮 `worker.json` / `server.log`、`service.csv`、`raw.jsonl` |
