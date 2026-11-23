@@ -1,5 +1,7 @@
 # Ouro 在昇腾主线上的 prefix cache 夜跑
 
+准备提交 PR 1 时，可使用[提交前全量验证](ascend_prefix_pr1_validation.md)运行正式服务回归、原生 BF16 矩阵及 HTTP 对照。
+
 在实验工作树和服务器已有的 CANN、torch-npu 环境中执行。选择一张空闲卡。
 
 ```bash

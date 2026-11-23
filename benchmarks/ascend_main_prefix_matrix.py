@@ -56,13 +56,13 @@ BENEFIT = (
 )
 
 
-def trial_order(round_index):
+def trial_order(round_index, modes=MODES):
     # Within each cache state A/B are adjacent. Rotate cache states, reverse A/B each round.
     offset = round_index % len(ARMS)
     return [
         (mode, arm)
         for arm in ARMS[offset:] + ARMS[:offset]
-        for mode in (MODES if (round_index + ARMS.index(arm)) % 2 == 0 else MODES[::-1])
+        for mode in (modes if (round_index + ARMS.index(arm)) % 2 == 0 else modes[::-1])
     ]
 
 
@@ -200,9 +200,11 @@ def metrics(runs):
     )
 
 
-def comparisons(rounds):
-    pairs = [(f"{arm}_grouping", ("main", arm), ("grouped", arm)) for arm in ARMS]
-    for mode in MODES:
+def comparisons(rounds, modes=MODES):
+    pairs = []
+    if "grouped" in modes:
+        pairs.extend((f"{arm}_grouping", ("main", arm), ("grouped", arm)) for arm in ARMS)
+    for mode in modes:
         pairs.extend(
             (f"{mode}_{a}_to_{b}", (mode, a), (mode, b))
             for a, b in (("off", "miss"), ("miss", "reuse"), ("off", "reuse"))
@@ -216,7 +218,7 @@ def comparisons(rounds):
     return {name: savings(timings(a), timings(b)) for name, a, b in pairs}
 
 
-def run_cases(args, model, report, names, *, linear_work=None):
+def run_cases(args, model, report, names, *, linear_work=None, modes=MODES):
     failed, csv_rows = [], []
     failed_comparisons = {}
     benefit_by_case = {}
@@ -234,7 +236,7 @@ def run_cases(args, model, report, names, *, linear_work=None):
         issues = []
         for i in range(-args.warmups, args.repeats):
             burst = {}
-            for mode, arm in trial_order(i):
+            for mode, arm in trial_order(i, modes):
                 loc = dict(case=name, round=i + 1, warmup=i < 0, mode=mode, arm=arm)
                 report.location = loc
                 try:
@@ -281,8 +283,9 @@ def run_cases(args, model, report, names, *, linear_work=None):
         )
         paired = {}
         if args.experiment == "benefit" and not issues:
-            paired = comparisons(rounds)
-            summary["reuse_grouping"] = paired["reuse_grouping"]
+            paired = comparisons(rounds, modes)
+            if "reuse_grouping" in paired:
+                summary["reuse_grouping"] = paired["reuse_grouping"]
             benefit_by_case[name] = {
                 key: paired[key]["median_saved_ms"]
                 for key in (
@@ -293,10 +296,11 @@ def run_cases(args, model, report, names, *, linear_work=None):
                     "off_grouping",
                     "miss_grouping",
                 )
+                if key in paired
             }
         report.record("CASE_DETAILS", case=name, all_issues=issues, paired_ttft=paired)
         report.record(report.kind + "_CASE", echo=True, **summary)
-        for mode in MODES:
+        for mode in modes:
             for arm in ARMS:
                 runs = [row[mode, arm] for row in rounds if (mode, arm) in row]
                 if not runs:
@@ -330,6 +334,7 @@ def run_cases(args, model, report, names, *, linear_work=None):
         failed_comparisons=failed_comparisons,
         warmups=args.warmups,
         repeats=args.repeats,
+        modes=list(modes),
         **({"paired_ttft_saved_ms": benefit_by_case} if args.experiment == "benefit" else {}),
     )
 
@@ -347,6 +352,11 @@ def main(argv=None):
     p.add_argument("--repeats", type=int)
     add_precision_arg(p)
     p.add_argument("--out-dir", type=Path, help="New output directory")
+    p.add_argument(
+        "--main-only",
+        action="store_true",
+        help="Exercise the PR1 runtime without experimental grouping",
+    )
     args = p.parse_args(argv)
     correctness = args.experiment != "benefit"
     if args.experiment == "fp32" and args.linear_fp32_chunk is None:
@@ -369,7 +379,14 @@ def main(argv=None):
         with padded_fp32_linears(model, args.linear_fp32_chunk) as work:
             if work is not None:
                 report.record("LINEAR_MODULES", modules=work[0])
-            return run_cases(args, model, report, names, linear_work=work)
+            return run_cases(
+                args,
+                model,
+                report,
+                names,
+                linear_work=work,
+                modes=("main",) if args.main_only else MODES,
+            )
 
     return report.execute(args, run)
 

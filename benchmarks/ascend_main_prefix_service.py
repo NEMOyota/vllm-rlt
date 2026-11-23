@@ -14,6 +14,7 @@ import sys
 import time
 from collections import defaultdict
 from contextlib import asynccontextmanager
+from itertools import combinations
 from pathlib import Path
 from uuid import uuid4
 
@@ -23,6 +24,7 @@ from benchmarks.ascend_main_prefix_combo import BLOCK, SEED
 from benchmarks.ascend_main_prefix_linear import add_precision_arg, check_linear_usage
 from benchmarks.ascend_main_prefix_results import Report, ids_digest, quantiles, savings, write_csv
 from benchmarks.ascend_prefix_combo_checks import require
+from benchmarks.ascend_prefix_opportunities import opportunities
 from vllm_rlt.models import load_tokenizer
 
 MODES = ("off", "main", "grouped")
@@ -273,6 +275,9 @@ def reconcile(mode, primers, plan, rows, audit, *, linear_fp32_chunk=None):
         state.get("backend") == "ascend_eager"
         and state["packed"]
         and state["dtype"] == "torch.bfloat16"
+        and state["linear_weight_dtypes"] == ["torch.bfloat16"]
+        and not state["async_scheduling"]
+        and not state["multi_stream"]
         and state["prefix_enabled"] == (mode != "off")
         and state["grouping_enabled"] == (mode == "grouped")
         and state.get("linear_fp32_chunk") == linear_fp32_chunk,
@@ -416,6 +421,7 @@ async def run_mode(args, report, mode, n, primers, plan, num_blocks, width):
         os.environ,
         RLT_BENCH_ATTENTION="grouped" if mode == "grouped" else "main",
         RLT_BENCH_AUDIT=str(audit.resolve()),
+        RLT_BENCH_PREFILL_STEPS="1" if args.observe_prefill else "0",
         RLT_BENCH_LINEAR_FP32_CHUNK=str(args.linear_fp32_chunk) if args.linear_fp32_chunk else "",
     )
     async with aiohttp.ClientSession(
@@ -435,6 +441,9 @@ async def run_mode(args, report, mode, n, primers, plan, num_blocks, width):
         mode, primers, plan, rows, captured, linear_fp32_chunk=args.linear_fp32_chunk
     )
     stats = summary(rows, wall)
+    if args.observe_prefill:
+        counts = opportunities(captured["prefill_steps"], plan)
+        (folder / "opportunities.json").write_text(json.dumps(counts, indent=2) + "\n")
     stats["group_calls"] = captured["state"]["group_calls"]
     report.record(
         "SERVICE_RUN",
@@ -482,6 +491,8 @@ def service_diffs(base, rows, label, n):
                     round=n,
                     id=left["id"],
                     first_diff_1based=pos,
+                    expected_id=left["tokens"][pos - 1] if pos else None,
+                    actual_id=right["tokens"][pos - 1] if pos else None,
                     text_matches=left["text_sha256"] == right["text_sha256"],
                 )
             )
@@ -489,6 +500,7 @@ def service_diffs(base, rows, label, n):
 
 
 async def exercise(args, report):
+    modes = ("off", "main") if args.main_only else MODES
     primers, plan = traffic(
         load_tokenizer(str(args.model.resolve())), args.requests, args.rps, args.seed
     )
@@ -500,19 +512,21 @@ async def exercise(args, report):
     width = max(r["prompt_tokens"] + r["output"] - 1 for r in inputs)
     report.record("MANIFEST", primers=primers, requests=plan, num_blocks=blocks, block_size=BLOCK)
     manifest = report.folder / "traffic.json"
-    manifest.write_text(
-        json.dumps(dict(primers=primers, requests=plan, num_blocks=blocks), indent=2) + "\n"
-    )
+    trace = dict(primers=primers, requests=plan, num_blocks=blocks)
+    manifest.write_text(json.dumps(trace, indent=2) + "\n")
+    if args.reference_traffic is not None:
+        expected = json.loads(args.reference_traffic.read_text())
+        require(trace == expected, f"generated workload differs from {args.reference_traffic}")
     errors = []
     diffs = []
     csv_rows = []
     first = {}
-    latencies = {mode: [] for mode in MODES}
+    latencies = {mode: [] for mode in modes}
     grouped_calls = []
     for i in range(args.rounds):
         runs = {}
-        offset = (i // 2) % len(MODES)
-        order = MODES[offset:] + MODES[:offset]
+        offset = (i // 2) % len(modes)
+        order = modes[offset:] + modes[:offset]
         if i % 2:
             order = order[::-1]
         for mode in order:
@@ -552,20 +566,22 @@ async def exercise(args, report):
                         output_tok_s=s["output_tok_s"] if cohort == "all" else None,
                     )
                 )
-        for a, b in (("off", "main"), ("main", "grouped"), ("off", "grouped")):
+        for a, b in combinations(modes, 2):
             diffs.extend(service_diffs(runs[a], runs[b], f"{a}_vs_{b}", i + 1))
     write_csv(report.folder / "service.csv", csv_rows)
     report.record("SERVICE_CHECKS", control_issues=errors, output_diffs=diffs)
     paired = {}
-    if not errors and not diffs:
+    if not args.observe_prefill and not errors and not diffs:
         paired["off_to_main"] = savings(latencies["off"], latencies["main"])
-        if all(sum(counts.values()) > 0 for counts in grouped_calls):
+        if grouped_calls and all(sum(counts.values()) > 0 for counts in grouped_calls):
             for mode in ("off", "main"):
                 paired[f"{mode}_to_grouped"] = savings(latencies[mode], latencies["grouped"])
     return report.review(
         "FAIL" if errors or diffs else "PASS",
         requests_per_mode=args.requests,
         rounds=args.rounds,
+        modes=list(modes),
+        diagnostic_replay=args.observe_prefill,
         control_issues=len(errors),
         output_diffs=len(diffs),
         examples=(errors + diffs)[:6],
@@ -591,6 +607,21 @@ def main(argv=None):
     p.add_argument("--num-blocks", type=int, help="Override pool that otherwise fits all prompts")
     p.add_argument("--startup-timeout", type=float, default=240)
     p.add_argument("--out-dir", type=Path, help="New output directory")
+    p.add_argument(
+        "--main-only",
+        action="store_true",
+        help="Compare cache off and on without installing experimental grouping",
+    )
+    p.add_argument(
+        "--reference-traffic",
+        type=Path,
+        help="Require the generated traffic.json to match a prior run before starting any worker",
+    )
+    p.add_argument(
+        "--observe-prefill",
+        action="store_true",
+        help="Record per-step geometry in a diagnostic replay; exclude latency comparisons",
+    )
     args = p.parse_args(argv)
     if (
         not args.model.is_dir()

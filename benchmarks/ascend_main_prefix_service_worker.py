@@ -7,6 +7,8 @@ from functools import partial
 from pathlib import Path
 from unittest.mock import patch
 
+from torch import nn
+
 from benchmarks.ascend_main_prefix_grouping import (
     GroupedAscendAttention,
     attention_mode,
@@ -18,6 +20,7 @@ from benchmarks.ascend_main_prefix_linear import (
     precision_settings,
 )
 from benchmarks.ascend_main_prefix_results import ids_digest
+from benchmarks.ascend_prefix_opportunities import observe_prefill
 from vllm_rlt.engine import worker
 from vllm_rlt.engine.stage_engine import StageEngine
 from vllm_rlt.entrypoints import serve
@@ -30,6 +33,7 @@ def observed_worker(mode, audit_path, *args, linear_fp32_chunk=None, **kwargs):
     records = []
     state = {}
     work = None
+    steps = []
     from_request = RequestOutput.from_request
     close = StageEngine.close
 
@@ -54,6 +58,15 @@ def observed_worker(mode, audit_path, *args, linear_fp32_chunk=None, **kwargs):
             backend=cache.backend,
             packed=engine.execution_config.packed_prefill,
             dtype=str(cache.dtype),
+            linear_weight_dtypes=sorted(
+                {
+                    str(module.weight.dtype)
+                    for module in engine.model.modules()
+                    if isinstance(module, nn.Linear)
+                }
+            ),
+            async_scheduling=engine.execution_config.async_scheduling,
+            multi_stream=engine.execution_config.multi_stream,
             prefix_enabled=cache.enable_prefix_caching,
             prefix_hits=cache.prefix_hits,
             prefix_queries=cache.prefix_queries,
@@ -67,6 +80,8 @@ def observed_worker(mode, audit_path, *args, linear_fp32_chunk=None, **kwargs):
 
     try:
         with ExitStack() as stack:
+            if os.environ.get("RLT_BENCH_PREFILL_STEPS") == "1":
+                stack.enter_context(observe_prefill(steps))
             if linear_fp32_chunk is not None:
 
                 def build_engine(model, *engine_args, **engine_kwargs):
@@ -80,7 +95,9 @@ def observed_worker(mode, audit_path, *args, linear_fp32_chunk=None, **kwargs):
             stack.enter_context(patch.object(StageEngine, "close", close_observed))
             worker.worker_main(*args, **kwargs)
     finally:
-        Path(audit_path).write_text(json.dumps(dict(state=state, requests=records)) + "\n")
+        Path(audit_path).write_text(
+            json.dumps(dict(state=state, requests=records, prefill_steps=steps)) + "\n"
+        )
 
 
 def main():
