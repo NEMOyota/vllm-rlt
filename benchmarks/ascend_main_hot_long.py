@@ -12,8 +12,10 @@ from statistics import median
 import torch
 
 from benchmarks import ascend_main_prefix_combo as combo
+from benchmarks import ascend_main_prefix_matrix as matrix
 from benchmarks.ascend_main_hot_long_audit import PrefillOps
 from benchmarks.ascend_main_prefix_linear import (
+    PreparedFP32Linears,
     check_linear_usage,
     linear_usage,
     padded_fp32_linears,
@@ -87,7 +89,9 @@ def service_input(path, tokenizer, request_id):
 
 
 @torch.inference_mode()
-def trial(model, target, primer, arm, work, diagnostic=False):
+def trial(
+    model, target, primer, arm, work, diagnostic=False, *, chunk_rows=CHUNK, time_q_pad=False
+):
     gc.collect()
     # Use exactly the same cache capacity and scheduler limits at all three lengths.
     engine = combo.open_engine(model, combo.Case(HIT, LENGTHS[-1] - HIT), arm)
@@ -117,7 +121,11 @@ def trial(model, target, primer, arm, work, diagnostic=False):
         kernel = cache.attention.kernel
         before_batched = kernel.batched_prefill_calls
         work[1].clear()
-        ops = PrefillOps(cache.device, CHUNK, n, hit) if diagnostic else None
+        ops = (
+            PrefillOps(cache.device, chunk_rows, n, hit, time_q_pad=time_q_pad)
+            if diagnostic
+            else None
+        )
         schedule = None
         with ops.observe(model) if ops is not None else nullcontext():
             start = time.perf_counter_ns()
@@ -175,7 +183,114 @@ def trial(model, target, primer, arm, work, diagnostic=False):
         engine.close()
 
 
-def run_cases(model, targets, donor, archive_token, args, report, work):
+def target_schedule(args):
+    for phase, rounds in (("warmup", 1), ("timing", args.repeats), ("audit", args.audit_repeats)):
+        for i in range(rounds):
+            offset = i % len(LENGTHS)
+            for n in LENGTHS[offset:] + LENGTHS[:offset]:
+                order_index = 2 * i if phase == "audit" else i
+                for arm in arm_order(order_index + 2 * LENGTHS.index(n)):
+                    yield phase, i, n, arm
+            print(f"HOT_LONG_PROGRESS {phase} {i + 1}/{rounds}", flush=True)
+
+
+def summarize_chunk(n, archive_token, records, issues):
+    tokens = sorted({record["first_token"] for record in records})
+    if len(tokens) != 1:
+        issues.append(dict(reason="first-token parity across arms or replays", tokens=tokens))
+    archive_match = tokens == [archive_token] if n == LENGTHS[0] else None
+    if archive_match is False:
+        issues.append(
+            dict(
+                reason="242-token first output differs from archived HTTP",
+                expected=archive_token,
+                actual=tokens,
+            )
+        )
+    times, audits = {}, {}
+    for arm in ARMS:
+        runs = [r for r in records if r["arm"] == arm]
+        times[arm] = [r["ttft_ms"] for r in runs if r["phase"] == "timing"]
+        audits[arm] = [r["ops"] for r in runs if r["phase"] == "audit"]
+        counts = {(r["linear_tiles"], r["q_proj_tiles"]) for r in audits[arm]}
+        if len(counts) > 1:
+            issues.append(dict(reason="linear tile count changed between audits", arm=arm))
+    arms, paired, paired_ops = {}, {}, {}
+    if not issues:
+        for arm in ARMS:
+            samples = audits[arm]
+            first = samples[0]
+            dist = quantiles(times[arm])
+            hit = HIT if arm == "reuse" else 0
+            arms[arm] = dict(
+                ttft_p50_ms=dist["p50"],
+                ttft_p95_ms=dist["p95"],
+                hit_tokens=hit,
+                prefill_rows=n - hit,
+                clock=first["clock"],
+                linear_tiles=first["linear_tiles"],
+                linear_padded_rows=first["linear_padded_rows"],
+                q_proj_tiles=first["q_proj_tiles"],
+                kv_read_p50_ms=round(median(s["kv_read_ms"] for s in samples), 3),
+                sdpa_p50_ms=round(median(s["sdpa_ms"] for s in samples), 3),
+            )
+            if "q_pad" in first["op_ms"]:
+                arms[arm]["q_pad_p50_ms"] = round(median(s["op_ms"]["q_pad"] for s in samples), 3)
+        for left, right in (("off", "miss"), ("off", "reuse"), ("miss", "reuse")):
+            paired[f"{left}_to_{right}"] = savings(times[left], times[right])
+        for key in ("kv_read_ms", "sdpa_ms"):
+            paired_ops[key] = savings(
+                [r[key] for r in audits["miss"]], [r[key] for r in audits["reuse"]]
+            )
+    return dict(
+        status="FAIL" if issues else "PASS",
+        first_tokens=tokens,
+        archived_first_match=archive_match,
+        arms=arms,
+        paired_ttft=paired,
+        audit_miss_to_reuse=paired_ops,
+        issues=issues,
+    ), times
+
+
+def check_sequences(model, n, target, donor, miss, chunks, prepared, records, report):
+    # Later tokens were sensitive to Linear geometry in previous experiments.
+    # Run the existing 16-token matrix oracle separately from both timing phases.
+    case = combo.Case(HIT, n - HIT)
+    inputs = donor, miss, {"target-0": target}, []
+    results, issues = {}, []
+    for chunk in chunks:
+        with prepared.fixed_rows(chunk) as work:
+            for arm in ARMS:
+                where = dict(phase="parity16", length=n, linear_fp32_chunk=chunk, arm=arm)
+                report.location = where
+                try:
+                    result = matrix.trial(model, case, "main", arm, inputs, linear_work=work)
+                except AssertionError as error:
+                    issues.append(dict(**where, reason=str(error)))
+                    report.record("CONTROL", echo=True, **issues[-1])
+                    continue
+                results[chunk, arm] = result
+                ids = result["requests"]["target-0"]["tokens"]
+                seen = {r["first_token"] for r in records[n, chunk] if r["arm"] == arm}
+                if seen != {ids[0]}:
+                    issues.append(
+                        dict(
+                            **where,
+                            reason="one-token and 16-token replay disagree",
+                            short=sorted(seen),
+                            long_first=ids[0],
+                        )
+                    )
+                report.record("TOKENS16", **where, tokens=ids, hit_tokens=result["hit_tokens"])
+    reference = results.get((CHUNK, "off"))
+    if reference is not None:
+        for (chunk, arm), result in results.items():
+            issues.extend(combo.token_diffs(reference, result, f"r{CHUNK}.off_vs_r{chunk}.{arm}"))
+    return dict(status="FAIL" if issues else "PASS", output_tokens=combo.OUTPUTS, issues=issues)
+
+
+def run_cases(model, targets, donor, archive_token, args, report, work=None):
     miss = [(donor[0] + 1) % model.config.vocab_size, *donor[1:]]
     require(shared_tokens(miss, targets[LENGTHS[0]]) == 0, "miss primer unexpectedly shares a page")
     report.record(
@@ -185,98 +300,81 @@ def run_cases(model, targets, donor, archive_token, args, report, work):
         donor_sha256=ids_digest(donor),
         miss_donor_sha256=ids_digest(miss),
     )
-    measured, audits = defaultdict(dict), defaultdict(list)
-    tokens = {n: set() for n in LENGTHS}
-    issues = {n: [] for n in LENGTHS}
-    phases = (("warmup", 1), ("timing", args.repeats), ("audit", args.audit_repeats))
-    for phase, rounds in phases:
-        for i in range(rounds):
-            offset = i % len(LENGTHS)
-            for n in LENGTHS[offset:] + LENGTHS[:offset]:
-                length_index = LENGTHS.index(n)
-                order_index = 2 * i if phase == "audit" else i
-                for arm in arm_order(order_index + 2 * length_index):
-                    where = dict(phase=phase, round=i + 1, length=n, arm=arm)
-                    report.location = where
-                    try:
-                        result = trial(
-                            model,
-                            targets[n],
-                            miss if arm == "miss" else donor,
-                            arm,
-                            work,
-                            diagnostic=phase == "audit",
-                        )
-                    except AssertionError as exc:
-                        problem = dict(**where, reason=str(exc))
-                        issues[n].append(problem)
-                        report.record("CONTROL", echo=True, **problem)
-                        continue
-                    report.record("TARGET", **where, **result)
-                    tokens[n].add(result["first_token"])
-                    if phase == "timing":
-                        measured[n, arm][i] = result["ttft_ms"]
-                    if phase == "audit":
-                        audits[n, arm].append(result["ops"])
-            print(f"HOT_LONG_PROGRESS {phase} {i + 1}/{rounds}", flush=True)
+    candidate = getattr(args, "compare_chunk", None)
+    chunks = (CHUNK, candidate) if candidate is not None else (CHUNK,)
+    prepared = PreparedFP32Linears(model) if candidate is not None else None
+    records, issues = defaultdict(list), defaultdict(list)
+    for phase, i, n, arm in target_schedule(args):
+        # Compare adjacent trials of the same arm. Alternate which size goes first.
+        reverse = (i + LENGTHS.index(n) + ARMS.index(arm)) % 2
+        order = chunks[::-1] if reverse else chunks
+        for rows in order:
+            where = dict(phase=phase, round=i + 1, length=n, arm=arm, linear_fp32_chunk=rows)
+            report.location = where
+            scope = prepared.fixed_rows(rows) if prepared is not None else nullcontext(work)
+            with scope as active:
+                try:
+                    result = trial(
+                        model,
+                        targets[n],
+                        miss if arm == "miss" else donor,
+                        arm,
+                        active,
+                        diagnostic=phase == "audit",
+                        chunk_rows=rows,
+                        time_q_pad=prepared is not None,
+                    )
+                except AssertionError as exc:
+                    problem = dict(**where, reason=str(exc))
+                    issues[n, rows].append(problem)
+                    report.record("CONTROL", echo=True, **problem)
+                    continue
+            record = where | result
+            report.record("TARGET", **record)
+            records[n, rows].append(record)
 
     cases, csv_rows = {}, []
     for n in LENGTHS:
-        if len(tokens[n]) != 1:
-            issues[n].append(
-                dict(reason="first-token parity across arms or replays", tokens=sorted(tokens[n]))
+        by_chunk, times = {}, {}
+        for rows in chunks:
+            summary, times[rows] = summarize_chunk(
+                n, archive_token, records[n, rows], issues[n, rows]
             )
-        archive_match = tokens[n] == {archive_token} if n == LENGTHS[0] else None
-        if archive_match is False:
-            issues[n].append(
-                dict(
-                    reason="242-token first output differs from archived HTTP",
-                    expected=archive_token,
-                    actual=sorted(tokens[n]),
-                )
+            by_chunk[rows] = summary
+        if prepared is None:
+            cases[n] = by_chunk[CHUNK]
+        else:
+            sequence = check_sequences(
+                model, n, targets[n], donor, miss, chunks, prepared, records, report
             )
-        for arm in ARMS:
-            counts = {(r["linear_tiles"], r["q_proj_tiles"]) for r in audits[n, arm]}
-            if len(counts) > 1:
-                issues[n].append(dict(reason="linear tile count changed between audits", arm=arm))
-        ok = not issues[n]
-        arms, paired, paired_ops = {}, {}, {}
-        if ok:
-            times = {arm: [measured[n, arm][i] for i in range(args.repeats)] for arm in ARMS}
-            for arm in ARMS:
-                samples = audits[n, arm]
-                times_summary = quantiles(times[arm])
-                summary = dict(
-                    ttft_p50_ms=times_summary["p50"],
-                    ttft_p95_ms=times_summary["p95"],
-                    hit_tokens=HIT if arm == "reuse" else 0,
-                    prefill_rows=n - HIT if arm == "reuse" else n,
-                    clock=samples[0]["clock"],
-                    linear_tiles=samples[0]["linear_tiles"],
-                    q_proj_tiles=samples[0]["q_proj_tiles"],
-                    kv_read_p50_ms=round(median(s["kv_read_ms"] for s in samples), 3),
-                    sdpa_p50_ms=round(median(s["sdpa_ms"] for s in samples), 3),
+            valid = sequence["status"] == "PASS" and all(
+                v["status"] == "PASS" for v in by_chunk.values()
+            )
+            across = (
+                {arm: savings(times[CHUNK][arm], times[candidate][arm]) for arm in ARMS}
+                if valid
+                else {}
+            )
+            cases[n] = dict(
+                status="PASS" if valid else "FAIL",
+                by_chunk=by_chunk,
+                parity16=sequence,
+                paired_256_to_candidate=across,
+            )
+        for rows, summary in by_chunk.items():
+            for arm, metrics in summary["arms"].items():
+                csv_rows.append(
+                    dict(
+                        length=n,
+                        arm=arm,
+                        linear_fp32_chunk=rows,
+                        status=cases[n]["status"],
+                        **metrics,
+                    )
                 )
-                arms[arm] = summary
-                csv_rows.append(dict(length=n, arm=arm, **summary))
-            for left, right in (("off", "miss"), ("off", "reuse"), ("miss", "reuse")):
-                paired[f"{left}_to_{right}"] = savings(times[left], times[right])
-            for key in ("kv_read_ms", "sdpa_ms"):
-                paired_ops[key] = savings(
-                    [r[key] for r in audits[n, "miss"]], [r[key] for r in audits[n, "reuse"]]
-                )
-        cases[n] = dict(
-            status="PASS" if ok else "FAIL",
-            first_tokens=sorted(tokens[n]),
-            archived_first_match=archive_match,
-            arms=arms,
-            paired_ttft=paired,
-            audit_miss_to_reuse=paired_ops,
-            issues=issues[n],
-        )
         report.record("HOT_LONG_CASE", echo=True, length=n, **cases[n])
     write_csv(report.folder / "cases.csv", csv_rows)
-    failed = [n for n in LENGTHS if issues[n]]
+    failed = [n for n, v in cases.items() if v["status"] == "FAIL"]
     return report.review(
         "FAIL" if failed else "PASS",
         cases=cases,
@@ -290,6 +388,12 @@ def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model", type=Path, required=True)
     p.add_argument("--service-raw", type=Path, required=True, help="Night run paced/raw.jsonl")
+    p.add_argument(
+        "--compare-chunk",
+        type=int,
+        metavar="ROWS",
+        help="Pair a fixed FP32 tile size with the 256-row control",
+    )
     p.add_argument("--request-id", help="Default: first matching 242-token hot_long request")
     p.add_argument("--repeats", type=int, default=6)
     p.add_argument("--audit-repeats", type=int, default=3)
@@ -303,7 +407,11 @@ def main(argv=None):
         or min(args.repeats, args.audit_repeats) < 1
     ):
         p.error("provide a local model, archived service raw.jsonl and positive repeat counts")
-    report = Report("HOT_LONG", args.out_dir, linear_fp32_chunk=CHUNK)
+    if args.compare_chunk is not None and (args.compare_chunk < 1 or args.compare_chunk == CHUNK):
+        p.error("--compare-chunk must be a positive row count different from 256")
+    report = Report(
+        "HOT_LONG", args.out_dir, linear_fp32_chunk=CHUNK, compare_chunk=args.compare_chunk
+    )
 
     def run(args, device, report):
         report.location = {"phase": "restore_prompt"}
@@ -316,11 +424,14 @@ def main(argv=None):
             request_id=rid,
             base_sha256=ids_digest(targets[LENGTHS[0]]),
             archived_first=archived,
+            sequence_check_tokens=combo.OUTPUTS if args.compare_chunk is not None else 1,
         )
         report.location = {"phase": "load_model"}
         model = OuroForCausalLM.from_pretrained(
             args.model, device=device, dtype=torch.bfloat16
         ).eval()
+        if args.compare_chunk is not None:
+            return run_cases(model, targets, donor, archived, args, report)
         with padded_fp32_linears(model, CHUNK) as work:
             return run_cases(model, targets, donor, archived, args, report, work)
 

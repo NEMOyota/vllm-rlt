@@ -16,13 +16,14 @@ from vllm_rlt.kernels import ascend_attention as ascend
 
 
 class PrefillOps:
-    """Count actual padded GEMMs. Time only K/V gathers and SDPA on their own stream."""
+    """Count padded GEMMs and time selected operations on their own stream."""
 
-    def __init__(self, device, chunk, length, hit):
+    def __init__(self, device, chunk, length, hit, *, time_q_pad=False):
         self.device = device
         self.chunk = chunk
         self.length = length
         self.width = length - hit
+        self.time_q_pad = time_q_pad
         self.flat = None
         self.active = None
         self.forwards = Counter()
@@ -56,7 +57,7 @@ class PrefillOps:
     @contextmanager
     def observe(self, model):
         flat_rows, select = ascend._flat_kv_rows, torch.Tensor.index_select
-        linear, sdpa = F.linear, F.scaled_dot_product_attention
+        linear, sdpa, native_pad = F.linear, F.scaled_dot_product_attention, F.pad
 
         def flat(*args):
             self.flat = flat_rows(*args)
@@ -83,6 +84,12 @@ class PrefillOps:
             )
             self.tiles[self.active] += 1
             return linear(input, weight, bias)
+
+        def pad_tile(input, pad, *args, **kwargs):
+            if self.active is not None and self.active[0] == "q_proj":
+                require(pad == (0, 0, 0, self.chunk - len(input)), "unexpected Q padding")
+                return self._measure("q_pad", native_pad, input, pad, *args, **kwargs)
+            return native_pad(input, pad, *args, **kwargs)
 
         def attention(query, key, value, **kwargs):
             mask = kwargs.get("attn_mask")
@@ -116,6 +123,8 @@ class PrefillOps:
                         )
                     )
             stack.enter_context(patch.object(F, "linear", project))
+            if self.time_q_pad:
+                stack.enter_context(patch.object(F, "pad", pad_tile))
             stack.enter_context(patch.object(ascend, "_flat_kv_rows", flat))
             stack.enter_context(patch.object(torch.Tensor, "index_select", gather))
             stack.enter_context(patch.object(F, "scaled_dot_product_attention", attention))
@@ -133,6 +142,9 @@ class PrefillOps:
         )
         for kind in ("k_read", "v_read", "sdpa"):
             require(len(self.spans[kind]) == expected_calls, f"missing {kind} calls")
+        if self.time_q_pad:
+            expected_pads = expected_calls if self.width % self.chunk else 0
+            require(len(self.spans["q_pad"]) == expected_pads, "unexpected number of Q pad calls")
         if self.device.type == "npu":
             torch.npu.synchronize(self.device)
             elapsed = {
@@ -144,6 +156,8 @@ class PrefillOps:
         return dict(
             clock="npu_stream_event_ms" if self.device.type == "npu" else "cpu_wall_ms",
             linear_tiles=self.tiles.total(),
+            linear_padded_rows=self.tiles.total() * self.chunk
+            - sum(rows * calls for (_, rows), calls in self.forwards.items()),
             q_proj_tiles=self.tiles["q_proj", self.width],
             projections=[
                 dict(family=name, input_rows=rows, calls=n, tiles=self.tiles[name, rows])

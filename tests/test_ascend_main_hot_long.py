@@ -1,6 +1,7 @@
 """Exercise the replay, observed operators, and the clean/diagnostic split on CPU."""
 
 import json
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -91,7 +92,8 @@ def test_event_pairs_are_read_after_one_device_fence(monkeypatch):
     assert metrics["kv_read_ms"] == 0.5 and metrics["sdpa_ms"] == 0.25
 
 
-def test_one_request_all_lengths_and_target_only_audits(tmp_path, monkeypatch):
+@pytest.fixture
+def packed_model(monkeypatch):
     monkeypatch.setattr(stage_engine, "packed_prefill_eligible", lambda *a, **kw: True)
     monkeypatch.setattr(
         stage_engine,
@@ -103,7 +105,11 @@ def test_one_request_all_lengths_and_target_only_audits(tmp_path, monkeypatch):
         ),
     )
     torch.manual_seed(168)
-    model = OuroForCausalLM(tiny_ouro_config(max_position_embeddings=300)).to(torch.bfloat16).eval()
+    return OuroForCausalLM(tiny_ouro_config(max_position_embeddings=300)).to(torch.bfloat16).eval()
+
+
+def test_one_request_all_lengths_and_target_only_audits(tmp_path, packed_model):
+    model = packed_model
     path, tokenizer, _ = archive(tmp_path)
     targets, donor, _, _ = bench.service_input(path, tokenizer, "target-5")
     report = Report("HOT_LONG", tmp_path / "result", linear_fp32_chunk=256)
@@ -145,7 +151,7 @@ def test_one_request_all_lengths_and_target_only_audits(tmp_path, monkeypatch):
 
 
 def test_failed_diagnostics_preserve_clean_trials_and_suppress_benefit(tmp_path, monkeypatch):
-    def fail(model, target, primer, arm, work, diagnostic):
+    def fail(model, target, primer, arm, work, diagnostic, **kwargs):
         if diagnostic:
             raise AssertionError("missing KV gathers")
         return dict(first_token=42, ttft_ms=1.0)
@@ -171,3 +177,103 @@ def test_failed_diagnostics_preserve_clean_trials_and_suppress_benefit(tmp_path,
     assert all(not c["paired_ttft"] for c in res["cases"].values())
     lines = list(map(json.loads, (report.folder / "raw.jsonl").read_text().splitlines()))
     assert sum(r.get("phase") == "timing" and "ttft_ms" in r for r in lines) == 9
+
+
+def test_adjacent_chunk_trials_use_actual_tile_sizes_and_matching_sequences(tmp_path, packed_model):
+    with torch.no_grad():
+        packed_model.lm_head.weight.zero_()
+    path, tokenizer, _ = archive(tmp_path)
+    targets, donor, _, _ = bench.service_input(path, tokenizer, None)
+    args = SimpleNamespace(repeats=2, audit_repeats=1, compare_chunk=64)
+    report = Report("HOT_LONG", tmp_path / "comparison", linear_fp32_chunk=256, compare_chunk=64)
+    try:
+        code = bench.run_cases(packed_model, targets, donor, 0, args, report)
+    finally:
+        report.stream.close()
+    review = json.loads((report.folder / "review.json").read_text())
+    raw = list(map(json.loads, (report.folder / "raw.jsonl").read_text().splitlines()))
+    assert code == 0 and review["linear_fp32_chunks"] == [256, 64]
+    assert len([r for r in raw if r["kind"] == "TOKENS16" and len(r["tokens"]) == 16]) == 18
+    timing = [r for r in raw if r.get("phase") == "timing" and r["kind"] == "TARGET"]
+    assert len(timing) == 36
+    orders = {}
+    for a, b in zip(timing[::2], timing[1::2], strict=True):
+        key = a["length"], a["arm"]
+        assert key == (b["length"], b["arm"]) and a["round"] == b["round"]
+        assert {a["linear_fp32_chunk"], b["linear_fp32_chunk"]} == {64, 256}
+        if a["round"] == 2:
+            assert orders[key] == b["linear_fp32_chunk"]
+        orders[key] = a["linear_fp32_chunk"]
+    for n in bench.LENGTHS:
+        case = review["cases"][str(n)]
+        assert case["parity16"]["status"] == "PASS"
+        assert all(case["paired_256_to_candidate"][arm]["pairs"] == 2 for arm in bench.ARMS)
+        for rows in (64, 256):
+            arms = case["by_chunk"][str(rows)]["arms"]
+            for arm, m in arms.items():
+                active = n - 208 if arm == "reuse" else n
+                assert m["q_proj_tiles"] == 8 * ((active + rows - 1) // rows)
+                assert (m["q_pad_p50_ms"] == 0) == (active % rows == 0)
+                assert m["linear_padded_rows"] >= 0
+
+
+def test_later_token_flip_blocks_comparison_and_slower_miss_does_not_mimic_reuse_gain(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        bench, "PreparedFP32Linears", lambda model: SimpleNamespace(fixed_rows=nullcontext)
+    )
+
+    def one(model, target, primer, arm, work, diagnostic, *, chunk_rows, time_q_pad):
+        assert chunk_rows == work
+        result = dict(first_token=42)
+        if diagnostic:
+            result["ops"] = dict(
+                linear_tiles=1,
+                q_proj_tiles=1,
+                linear_padded_rows=0,
+                kv_read_ms=1,
+                sdpa_ms=1,
+                op_ms={"q_pad": 0},
+                clock="cpu_wall_ms",
+            )
+        else:
+            t = {256: dict(off=10, miss=10, reuse=11), 64: dict(off=29, miss=30, reuse=12)}
+            result["ttft_ms"] = t[work][arm]
+        return result
+
+    def sixteen(model, case, mode, arm, inputs, *, linear_work):
+        ids = [42] * 16
+        if len(inputs[2]["target-0"]) == 256 and arm == "reuse" and linear_work == 64:
+            ids[7] = 93
+        return {
+            "requests": {"target-0": {"tokens": ids}},
+            "hit_tokens": {"target-0": 208 if arm == "reuse" else 0},
+        }
+
+    monkeypatch.setattr(bench, "trial", one)
+    monkeypatch.setattr(bench.matrix, "trial", sixteen)
+    path, tokenizer, _ = archive(tmp_path)
+    targets, donor, _, _ = bench.service_input(path, tokenizer, None)
+    report = Report("HOT_LONG", tmp_path / "comparison", linear_fp32_chunk=256, compare_chunk=64)
+    try:
+        code = bench.run_cases(
+            SimpleNamespace(config=SimpleNamespace(vocab_size=64)),
+            targets,
+            donor,
+            42,
+            SimpleNamespace(repeats=2, audit_repeats=1, compare_chunk=64),
+            report,
+        )
+    finally:
+        report.stream.close()
+    review = json.loads((report.folder / "review.json").read_text())
+    assert code == 1 and review["failed"] == [256]
+    failed = review["cases"]["256"]
+    assert (
+        not failed["paired_256_to_candidate"]
+        and failed["parity16"]["issues"][0]["first_diff_1based"] == 8
+    )
+    ok = review["cases"]["242"]
+    assert ok["by_chunk"]["64"]["paired_ttft"]["miss_to_reuse"]["median_saved_ms"] == 18
+    assert ok["paired_256_to_candidate"]["reuse"]["median_saved_ms"] == -1

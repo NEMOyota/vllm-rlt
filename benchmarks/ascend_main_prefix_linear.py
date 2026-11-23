@@ -83,17 +83,11 @@ def _padded_linear(weight, bias, rows, matmul, calls, name, input):
     return result.reshape(*input.shape[:-1], weight.shape[0])
 
 
-@contextmanager
-def padded_fp32_linears(model, rows):
-    """Install on each model Linear, including the exit gate and LM head, then restore."""
-    if rows is None:
-        yield None
-        return
-    if type(rows) is not int or rows < 1:
-        raise ValueError("linear FP32 chunk size must be a positive number of rows")
-    names = []
-    calls = Counter()
-    with ExitStack() as stack:
+class PreparedFP32Linears:
+    """Keep one FP32 copy of each Linear's parameters across paired configurations."""
+
+    def __init__(self, model):
+        self.layers = []
         for name, module in model.named_modules():
             if not isinstance(module, nn.Linear):
                 continue
@@ -102,9 +96,31 @@ def padded_fp32_linears(model, rows):
             weight = module.weight.detach().float()
             bias = module.bias.detach().float() if module.bias is not None else None
             matmul = getattr(torch.npu, "matmul", None) if weight.device.type == "npu" else None
-            forward = partial(_padded_linear, weight, bias, rows, matmul, calls, name)
-            stack.enter_context(patch.object(module, "forward", forward))
-            names.append(name)
-        if not names:
+            self.layers.append((name, module, weight, bias, matmul))
+        if not self.layers:
             raise ValueError("model contains no nn.Linear")
-        yield names, calls
+
+    @contextmanager
+    def fixed_rows(self, rows):
+        if type(rows) is not int or rows < 1:
+            raise ValueError("linear FP32 chunk size must be a positive number of rows")
+        calls = Counter()
+        with ExitStack() as stack:
+            names = []
+            for name, module, weight, bias, matmul in self.layers:
+                forward = partial(_padded_linear, weight, bias, rows, matmul, calls, name)
+                stack.enter_context(patch.object(module, "forward", forward))
+                names.append(name)
+            yield names, calls
+
+
+@contextmanager
+def padded_fp32_linears(model, rows):
+    """Install on each model Linear, including the exit gate and LM head, then restore."""
+    if rows is None:
+        yield None
+        return
+    if type(rows) is not int or rows < 1:
+        raise ValueError("linear FP32 chunk size must be a positive number of rows")
+    with PreparedFP32Linears(model).fixed_rows(rows) as work:
+        yield work

@@ -47,10 +47,14 @@ def write_csv(path, rows):
 
 
 class Report:
-    def __init__(self, kind, folder, *, linear_fp32_chunk=None):
+    def __init__(self, kind, folder, *, linear_fp32_chunk=None, compare_chunk=None):
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         self.math = precision_settings(linear_fp32_chunk)
         suffix = "" if linear_fp32_chunk is None else f"-fp32-r{linear_fp32_chunk}"
+        if compare_chunk is not None:
+            self.math.pop("linear_fp32_chunk")
+            self.math["linear_fp32_chunks"] = [linear_fp32_chunk, compare_chunk]
+            suffix += f"-vs-r{compare_chunk}"
         self.folder = folder or Path("results") / f"main-prefix-{kind.lower()}{suffix}-{stamp}"
         self.folder.mkdir(exist_ok=False, parents=True)
         self.kind = kind
