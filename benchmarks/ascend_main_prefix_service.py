@@ -16,6 +16,7 @@ from collections import defaultdict
 from contextlib import asynccontextmanager
 from itertools import combinations
 from pathlib import Path
+from statistics import median
 from uuid import uuid4
 
 import aiohttp
@@ -514,6 +515,37 @@ def service_diffs(base, rows, label, n):
     return issues
 
 
+def similar_service_result(rows, counters, *, valid):
+    """Read the incremental exact/similar signal across all paired rounds."""
+    triggers = [c.get("padded_groups", 0) for c in counters]
+    result = {"padded_groups_per_round": triggers}
+    if not valid:
+        return result | {"status": "invalid_controls_or_diagnostic"}
+    if not any(triggers):
+        return result | {"status": "no_similar_groups"}
+    exact = {r["round"]: r for r in rows if r["cohort"] == "all" and r["mode"] == "exact"}
+    delta = []
+    for row in rows:
+        if row["cohort"] == "all" and row["mode"] == "similar":
+            base = exact[row["round"]]
+            delta.append(
+                dict(
+                    round=row["round"],
+                    ttft_p50_saved_ms=base["ttft_p50_ms"] - row["ttft_p50_ms"],
+                    ttft_p95_saved_ms=base["ttft_p95_ms"] - row["ttft_p95_ms"],
+                    output_tok_s_change=row["output_tok_s"] - base["output_tok_s"],
+                )
+            )
+    result["all_round_deltas"] = delta
+    if not all(triggers) or len(delta) < 3:
+        return result | {"status": "limited_samples"}
+    improved = sum(d["ttft_p50_saved_ms"] > 0 for d in delta) > len(delta) / 2
+    stable = all(
+        median(d[key] for d in delta) >= 0 for key in ("ttft_p95_saved_ms", "output_tok_s_change")
+    )
+    return result | {"status": "favorable_direction" if improved and stable else "mixed_or_flat"}
+
+
 async def exercise(args, report):
     pr2 = getattr(args, "pr2_slack", None) is not None
     modes = ("main", "exact", "similar") if pr2 else (("off", "main") if args.main_only else MODES)
@@ -616,6 +648,11 @@ async def exercise(args, report):
         if grouped_calls and all(sum(counts.values()) > 0 for counts in grouped_calls):
             for mode in ("off", "main"):
                 paired[f"{mode}_to_grouped"] = savings(latencies[mode], latencies["grouped"])
+    incremental = {}
+    if pr2:
+        incremental["similar_service"] = similar_service_result(
+            csv_rows, prefix_groups["similar"], valid=not (args.observe_prefill or errors or diffs)
+        )
     return report.review(
         "FAIL" if errors or diffs else "PASS",
         requests_per_mode=args.requests,
@@ -628,6 +665,7 @@ async def exercise(args, report):
         grouped_calls_per_round=grouped_calls,
         prefix_groups_per_round=dict(prefix_groups),
         paired_ttft=paired,
+        **incremental,
     )
 
 

@@ -109,6 +109,31 @@ def test_service_only_attributes_similar_savings_when_exercised(tmp_path, monkey
     ]
     assert ("exact_to_similar" in review["paired_ttft"]) == bool(padded)
     assert set(review["prefix_groups_per_round"]) == {"main", "exact", "similar"}
+    assert review["similar_service"]["status"] == (
+        "mixed_or_flat" if padded else "no_similar_groups"
+    )
+
+
+def test_performance_verdict_uses_all_rounds_and_tail_and_throughput():
+    rows = []
+    for i in range(3):
+        base = dict(round=i + 1, cohort="all", ttft_p50_ms=10, ttft_p95_ms=20, output_tok_s=8)
+        rows.extend([dict(base, mode="exact"), dict(base, mode="similar", ttft_p50_ms=9)])
+    counters = [{"padded_groups": 2}] * 3
+    assert (
+        service.similar_service_result(rows, counters, valid=True)["status"]
+        == "favorable_direction"
+    )
+    for row in rows:
+        if row["mode"] == "similar":
+            row["ttft_p95_ms"] = 25
+    assert service.similar_service_result(rows, counters, valid=True)["status"] == "mixed_or_flat"
+    limited = service.similar_service_result(rows, [{}, *counters[:2]], valid=True)
+    assert limited["status"] == "limited_samples" and len(limited["all_round_deltas"]) == 3
+    assert (
+        service.similar_service_result(rows, counters, valid=False)["status"]
+        == "invalid_controls_or_diagnostic"
+    )
 
 
 def test_opportunity_estimate_accounts_for_unequal_starts_and_padding():

@@ -403,6 +403,9 @@ def markdown_report(out, report):
             ["", f"[按冷热和长度查看]({name}/service.csv) · [逐请求审计]({name}/raw.jsonl)"]
         )
         if name.startswith("pr2-"):
+            verdict = stage.get("evidence", {}).get("similar_service", {})
+            if verdict:
+                lines.extend(["", f"近似相对等长的服务结果 `{verdict['status']}`。", ""])
             for mode, rounds in (
                 stage.get("evidence", {}).get("prefix_groups_per_round", {}).items()
             ):

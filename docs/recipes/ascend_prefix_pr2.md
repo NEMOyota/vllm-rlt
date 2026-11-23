@@ -50,3 +50,5 @@ python -m benchmarks.ascend_prefix_pr2 --model "$MODEL" --case near --repeats 3
 | `pr2-profile` | 对近似后缀的三种模式分别预热，采集目标 prefill 单步的 ops-only/full 设备 trace，校验设备 kernel，full 另外校验形状、栈与内存记录。性能结论取自关闭 profiler 的轮次。 |
 
 正确性要求每个对照请求的命中、输出、循环和结束原因一致。数值或控制检查失败时保留证据，排除对应性能结论。服务量化看同卡、同工作量下各轮 TTFT、P95、吞吐，同时列出新增分数位置与省下的 SDPA 调用。只有实际执行了近似合批，才用这些样本归因近似策略的增益。零触发本身就是负载结果。受控场景节省调用可以证明机制生效，是否适合默认开启由 B3、B4 上目标流量的收益和回退决定。
+
+`similar_service` 单列近似相对等长的服务结果。`no_similar_groups` 表示本负载没有触发近似合批。`limited_samples` 表示触发不连续或轮次少于三，保留全轮差值。`favorable_direction` 要求每轮均触发、多数轮 TTFT P50 变快，且配对 P95 节省量、输出吞吐增量的中位数均非负。`mixed_or_flat` 表示该组结果未达到此判据。这是小样本方向性判据，PR 中同时展示原始轮次和样本数。
