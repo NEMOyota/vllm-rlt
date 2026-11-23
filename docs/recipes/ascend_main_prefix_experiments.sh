@@ -41,6 +41,9 @@ case "$experiment" in
   combo)
     exec python -m benchmarks.ascend_main_prefix_combo --model "$model" "$@"
     ;;
+  hot-long)
+    exec python -m benchmarks.ascend_main_hot_long --model "$model" "$@"
+    ;;
   bf16|fp32|benefit)
     exec python -m benchmarks.ascend_main_prefix_matrix "$experiment" --model "$model" "$@"
     ;;
@@ -48,7 +51,7 @@ case "$experiment" in
     exec python -m benchmarks.ascend_main_prefix_service --model "$model" "$@"
     ;;
   *)
-    echo "Usage: bash docs/recipes/ascend_main_prefix_experiments.sh {fp32-all|combo|fp32|bf16|benefit|service} [options]" >&2
+    echo "Usage: bash docs/recipes/ascend_main_prefix_experiments.sh {fp32-all|combo|fp32|bf16|benefit|service|hot-long} [options]" >&2
     exit 2
     ;;
 esac

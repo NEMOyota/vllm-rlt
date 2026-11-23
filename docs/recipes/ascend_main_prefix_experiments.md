@@ -72,3 +72,29 @@ bash docs/recipes/ascend_main_prefix_experiments.sh service --linear-fp32-chunk 
 `SERVICE_REVIEW.grouped_calls_per_round` 给出每轮真实合批次数。若某轮缺少可合并的请求，仍可看端到端负载表现。只有每轮都观察到合批且核对通过时，汇总才会列出合批的配对收益。
 
 HTTP 实验在实际持有模型的独立工作进程安装线性层配置。每次从 worker 核对分块大小和执行计数。CSV 和汇总带有 `precision` 和 `linear_fp32_chunk`，便于按相同精度比较。
+
+## 5　单请求 hot_long 和 256 行分块边界
+
+在同一份工作树、空闲卡和夜跑 checkpoint 上执行。把 `--service-raw` 指向已有的服务原始日志。脚本从 MANIFEST 恢复真实请求和 `primer_long`，用本机 tokenizer 核对两份 token ID 的 SHA-256，并用 SERVICE_RUN 核对原请求的首 token。
+
+```bash
+export MODEL=/models/Ouro-1.4B
+export ASCEND_RT_VISIBLE_DEVICES=2
+bash docs/recipes/ascend_main_prefix_experiments.sh hot-long \
+  --service-raw /workspace/rlt-prefix-night-Vjc1lL/results/main-prefix-fp32-r256-gMZbiLg7/paced/raw.jsonl \
+  --request-id target-5 --repeats 6 --audit-repeats 3
+```
+
+| 目标长度 | 复用 token | 实际后缀行数 | 单次逐 token 投影的完整输入块数 → 命中后的块数 |
+| ---: | ---: | ---: | --- |
+| 242 | 208 | 34 | 1 → 1 |
+| 256 | 208 | 48 | 1 → 1 |
+| 257 | 208 | 49 | 2 → 1 |
+
+242 是原请求的 token 序列。两个对照在它末尾追加原请求最后 15 个 token 中的前 14 或全部 15 个，257 和 256 仅差最后一个 token。只在同一长度内比输出；242 的首 token 也与存档比较。此实验使用主线同步引擎、并发 1、固定 4 次循环、生成 1 个 token，所有线性层用 FP32 定长 256 行，KV 与 SDPA 用 BF16。
+
+每条目标请求都用新引擎和相同大小的 KV 池。先执行与目标分开的预热请求。off 关闭缓存，reuse 用归档的长前缀预热，miss 仅替换预热请求的第一个 token。三臂的目标输入相同。待预热完成并同步后，计时从提交目标请求开始，到引擎返回首 token 为止。每种组合先预热一次，再做 6 轮配对，轮换长度并交替三臂的顺序。
+
+最后单独重放 3 轮采集算子数据。按投影类型统计实际执行的 FP32 `F.linear` 块数。只为当前层 K/V 读取用的两个 `index_select` 以及 BF16 SDPA 记录 NPU stream event，取每次重放内相应区间耗时之和，再报跨重放中位数。读数据量按返回张量的字节数记录。时间可能含流内等待；页表和掩码构造、Q 收集、输出写回等工作另占时间。诊断重放独立于首 token 的计时样本。
+
+启动时打印结果目录。看 `review.json` 中三个长度的 `paired_ttft.miss_to_reuse`，正值表示命中节省时间。`audit_miss_to_reuse` 给出诊断轮逐对的 KV 读取和 SDPA 设备流时间差。各臂的 `q_proj_tiles`、`linear_tiles`、`kv_read_p50_ms`、`sdpa_p50_ms` 同时列在 `cases.csv`。Ouro-1.4B 有 24 层、4 次循环，257 行完整输入预期共 192 个 Q 投影块，三个长度的命中臂各 96 个。逐轮顺序、命中边界、模块执行、计时、K/V 和 SDPA 调用数均在 `raw.jsonl`。检查失败的长度保留逐轮数据并标出原因；意外运行错误会报告 INCOMPLETE 和出错位置。

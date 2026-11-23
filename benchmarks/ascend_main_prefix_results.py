@@ -84,6 +84,8 @@ class Report:
             )
             if self.kind == "SERVICE":
                 info.update(seed=args.seed, output_tokens=[8, 16])
+            elif self.kind == "HOT_LONG":
+                info["output_tokens"] = 1
             self.record(
                 "ENV",
                 **info,
