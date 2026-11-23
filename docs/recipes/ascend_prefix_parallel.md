@@ -1,6 +1,6 @@
 # Ascend prefix cache 并行验收
 
-在已激活 CANN、torch-npu 和项目测试依赖的 Linux 容器中，分别检出两个候选。测试入口使用已提交的 Git 快照。两个分支的结果目录分别带有完整候选 SHA。
+在已激活 CANN、torch-npu 和项目测试依赖的 Linux 容器中，分别检出两个候选。测试入口使用已提交的 Git 快照。两个分支的结果目录分别带有完整候选 SHA。默认使用各分支 HEAD。用 `--pr1-ref` 或 `--pr2-ref` 指定旧候选时，报告分别记录候选与验收脚本 SHA。
 
 ```bash
 git clone -b test/ascend-prefix-pr1-validation --single-branch https://github.com/NEMOyota/vllm-rlt.git rlt-pr1
@@ -17,5 +17,5 @@ python -m benchmarks.ascend_prefix_parallel --pr1-repo ../rlt-pr1 --pr2-repo . \
 
 - **引擎阶段。** 卡号按参数顺序使用。前四张均分 PR1 的 30 例，接下来两张均分 PR2 的六组形状，最后两张分别负责两个候选的入口与设备回归。设备数较少时，任务映射到已有卡并串行排队。每个场景的三个精度和各对照模式在同卡执行。
 - **HTTP 阶段。** 全部引擎任务结束后才启动。burst 和 paced 各占一张卡，两个 PR 依次回放同一流量。各并发 worker 及其服务子进程使用各自的卡选择器、CPU 亲和集合、端口和目录。PR2 的机会统计来自实际计时回放，保留 host 观测开销，跨模式使用同一观测设置。
-- **轮数。** 正确性专用实验执行两个独立轮次。矩阵、合批和 HTTP 各完成三轮配对测量，前两轮给出正式 token 正确性结论，第三轮同时核对性能样本的可比性。benchmark 的整场预热设为零，构造命中的 donor 请求属于用例前置条件。每款卡核对一次型号，每个候选各跑一次自己的 CPU 和原生 NPU 基础回归。
+- **轮数。** 正确性专用实验执行两个独立轮次。矩阵、合批和 HTTP 各完成三轮配对测量，前两轮给出正式 token 正确性结论，第三轮同时核对性能样本的可比性。benchmark 的整场预热设为零，构造命中的 donor 请求属于用例前置条件。PR1 每轮包含页级审计和四个历史用例的 logit 回放。计时结束后，两个候选在每种精度各采一组代表性 profiler trace，单独归档。每个选中的设备核对一次型号，每个候选各跑一次自己的 CPU 和原生 NPU 基础回归。
 - **读报告。** 从终端打印的目录打开 `PR_RESULTS.md`。根目录的 `plan.json`、`review.json` 记录分配、硬件和完成状态。每项工作在 `<PR>/<SHA>/<卡型>/<精度>/<任务>/` 保存命令、日志和数据。矩阵分片按场景、轮次和模式保留原始 token、性能和首处分歧。HTTP 的 `data/service.csv` 按轮列出 P50、P95 和吞吐，PR2 的 `data/round-<n>-<模式>/opportunities.json` 记录机会和分母。正确性失败保留原始时延，并继续运行其余工作。缺少或重复测量记 INCOMPLETE。

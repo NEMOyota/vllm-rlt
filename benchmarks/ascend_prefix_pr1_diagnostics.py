@@ -20,6 +20,8 @@ from benchmarks import ascend_main_prefix_combo as combo
 from benchmarks import ascend_main_prefix_matrix as matrix
 from benchmarks.ascend_main_prefix_linear import (
     add_precision_arg,
+    check_linear_usage,
+    linear_usage,
     padded_fp32_linears,
     precision_settings,
 )
@@ -281,8 +283,9 @@ def prefill_window(model, case, inputs, arm, capture):
     engine = combo.open_engine(model, case, arm)
     try:
         require(
-            engine.execution_config.packed_prefill and engine.cache_manager.dtype == torch.bfloat16,
-            "expected native packed BF16",
+            engine.execution_config.packed_prefill
+            and engine.cache_manager.dtype == model.lm_head.weight.dtype,
+            "expected packed KV with model dtype",
         )
         params = SamplingParams(
             max_tokens=1,
@@ -331,10 +334,10 @@ def main():
     p.add_argument("--dtype", choices=("bfloat16", "float16"), default="bfloat16")
     add_precision_arg(p)
     args = p.parse_args()
-    if args.linear_fp32_chunk is not None and args.task != "drift":
-        p.error("--linear-fp32-chunk applies to drift replays")
-    if args.dtype == "float16" and (args.task != "drift" or args.linear_fp32_chunk is not None):
-        p.error("--dtype float16 requires a native drift replay with no FP32 Linear override")
+    if args.linear_fp32_chunk is not None and args.task == "env":
+        p.error("--linear-fp32-chunk requires drift or profile")
+    if args.dtype == "float16" and (args.task == "env" or args.linear_fp32_chunk is not None):
+        p.error("--dtype float16 requires a native replay or profile with no FP32 Linear override")
     dtype = getattr(torch, args.dtype)
     args.out.mkdir(parents=True, exist_ok=False)
     device = resolve_device("npu:0")
@@ -376,20 +379,32 @@ def main():
         "profile requires a single request with an actual cache hit",
     )
     inputs = combo.workload(case, model.config.vocab_size)
-    rows = {}
-    for arm in ("miss", "reuse"):
-        prefill_window(model, case, inputs, arm, nullcontext())
-    for full in (False, True):
+    with padded_fp32_linears(model, args.linear_fp32_chunk) as work:
+        rows = {}
         for arm in ("miss", "reuse"):
-            label = ("full-" if full else "ops-") + arm
-            folder = args.out / label
-            folder.mkdir()
-            row = prefill_window(model, case, inputs, arm, capture_context(folder, full))
-            row["artifacts"] = checked_profile_files(folder, full)
-            save(folder / "evidence.json", row)
-            rows[label] = row
+            prefill_window(model, case, inputs, arm, nullcontext())
+        for full in (False, True):
+            for arm in ("miss", "reuse"):
+                label = ("full-" if full else "ops-") + arm
+                folder = args.out / label
+                folder.mkdir()
+                row = prefill_window(model, case, inputs, arm, capture_context(folder, full))
+                row["artifacts"] = checked_profile_files(folder, full)
+                save(folder / "evidence.json", row)
+                rows[label] = row
+        if work is not None:
+            check_linear_usage(linear_usage(work))
     same_ids = len({tuple(r["token_ids"]) for r in rows.values()}) == 1
-    save(args.out / "review.json", dict(case=name, captures=list(rows), same_token_ids=same_ids))
+    save(
+        args.out / "review.json",
+        dict(
+            **precision_settings(args.linear_fp32_chunk, dtype=dtype),
+            status="PASS" if same_ids else "FAIL",
+            case=name,
+            captures=list(rows),
+            same_token_ids=same_ids,
+        ),
+    )
     return int(not same_ids)
 
 

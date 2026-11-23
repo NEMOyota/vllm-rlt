@@ -96,6 +96,19 @@ def plan(projects, cards):
                         cases,
                     )
                 )
+            profile = (
+                (
+                    suite.DIAGNOSTICS,
+                    "profile",
+                    "--dtype",
+                    "float16" if precision == "native_fp16" else "bfloat16",
+                )
+                if pr1
+                else ("benchmarks.ascend_prefix_pr2", "--profile", "--case", "near")
+            )
+            jobs.append(
+                Job(project, precision, "trace", entry_card, "prefill-trace", profile + chunk)
+            )
             for n in range(1, CORRECTNESS + 1):
                 tests = (
                     [suite.CONTRACT, STOCK_HTTP] if pr1 else [suite.CONTRACT, STOCK_HTTP, ORACLE]
@@ -111,6 +124,32 @@ def plan(projects, cards):
                     )
                 )
                 if pr1:
+                    jobs.append(
+                        Job(
+                            project,
+                            precision,
+                            "engine",
+                            entry_card,
+                            f"page-audit/round-{n}",
+                            (suite.COMBO, "--repeats", "1", *chunk),
+                        )
+                    )
+                    jobs.append(
+                        Job(
+                            project,
+                            precision,
+                            "engine",
+                            entry_card,
+                            f"logit-replay/round-{n}",
+                            (
+                                suite.DIAGNOSTICS,
+                                "drift",
+                                "--dtype",
+                                "float16" if precision == "native_fp16" else "bfloat16",
+                                *chunk,
+                            ),
+                        )
+                    )
                     jobs.append(
                         Job(
                             project,
@@ -170,7 +209,22 @@ def check_rounds(job, folder):
         for line in stream:
             row = json.loads(line)
             if row["kind"] == kind and not row.get("warmup"):
-                actual[row.get("case", ""), row["round"], row.get("arm", row["mode"])] += 1
+                label, chunk = (
+                    ("linear_fp32_padded", 256)
+                    if job.precision == PRECISIONS[2]
+                    else (job.precision, None)
+                )
+                if row["precision"] != label or row["linear_fp32_chunk"] != chunk:
+                    raise ValueError(
+                        f"wrong precision for {job.name}: "
+                        f"{row['precision']} / {row['linear_fp32_chunk']}"
+                    )
+                mode = row["arm"] if "arm" in row else row["mode"]
+                actual[row.get("case", ""), row["round"], mode] += 1
+                if job.project == "pr2" and job.phase == "http":
+                    observations = folder / f"round-{row['round']}-{mode}" / "opportunities.json"
+                    if not observations.is_file():
+                        raise ValueError(f"missing opportunities: {observations}")
     if expected != actual:
         raise ValueError(
             f"round coverage mismatch: missing={expected - actual}, extra={actual - expected}"
@@ -197,15 +251,21 @@ def execute(job, tree, root, cpu_ids, port, common_env, manifests):
         command = [PY, "-m", "pytest", "--run-npu", "-q", "--junitxml", str(artifact), *args[1:]]
     else:
         data = folder / "data"
-        artifact = data / "review.json"
+        artifact = data / ("raw.jsonl" if args[0] == suite.COMBO else "review.json")
+        if args[0] == suite.COMBO:
+            data.mkdir()
+        destination = (
+            ["--out", str(artifact)]
+            if args[0] == suite.COMBO
+            else ["--out" if args[0] == suite.DIAGNOSTICS else "--out-dir", str(data)]
+        )
         command = [
             PY,
             "-m",
             *args,
             "--model",
             env["VLLM_RLT_OURO_CHECKPOINT"],
-            "--out-dir",
-            str(data),
+            *destination,
         ]
     command = ["taskset", "-c", ",".join(map(str, cpu_ids)), *command]
     stage = suite.Stage("worker", command, artifact)
@@ -294,12 +354,14 @@ def main(argv=None):
         )
         for pr, repo in projects.items()
     }
+    harness = {pr: suite.git(repo, "rev-parse", "HEAD") for pr, repo in projects.items()}
     jobs = plan(projects, cards)
     if args.list:
         print(
             json.dumps(
                 dict(
                     candidates=refs,
+                    harness=harness,
                     correctness_rounds=CORRECTNESS,
                     performance_rounds=PERFORMANCE,
                     jobs=[asdict(j) for j in jobs],
@@ -326,6 +388,7 @@ def main(argv=None):
         env.pop(key, None)
     report = dict(
         candidates=refs,
+        harness=harness,
         chip=args.chip,
         cards=cards,
         hardware={},
@@ -364,6 +427,28 @@ def main(argv=None):
             fp16 = Path(tmp) / (pr + "-fp16")
             suite.git(tree, "worktree", "add", "--quiet", "--detach", str(fp16), "HEAD")
             trees[pr, True] = fp16
+            if refs[pr] != harness[pr]:
+                # Use this branch’s test harness with the selected product runtime.
+                paths = [
+                    s
+                    for s in suite.git(
+                        repo,
+                        "ls-tree",
+                        "-r",
+                        "--name-only",
+                        harness[pr],
+                        "--",
+                        "benchmarks",
+                        suite.STOCK,
+                        suite.CONTRACT,
+                        ORACLE,
+                    ).splitlines()
+                    if s.startswith(("benchmarks/ascend_", "tests/"))
+                ]
+                for target in (tree, fp16):
+                    suite.git(
+                        target, "restore", "--source", harness[pr], "--worktree", "--", *paths
+                    )
             manifest = roots[pr] / "environment"
             manifest.mkdir(parents=True)
             for name in ("ascend_prefix_fp16_replay.patch", "ascend_prefix_fp16_http.patch"):
@@ -380,9 +465,20 @@ def main(argv=None):
             if not args.device_only:
                 cpu_dir = roots[pr].parent / "cpu-regression"
                 proc = subprocess.run(
-                    [PY, "-m", "benchmarks.ascend_prefix_pr1_suite", "cpu", "--out", str(cpu_dir)],
-                    cwd=tree,
-                    env=dict(env, PYTHONPATH=str(tree)),
+                    [
+                        PY,
+                        "-m",
+                        "benchmarks.ascend_prefix_pr1_suite",
+                        "cpu",
+                        "--repo",
+                        str(repo),
+                        "--candidate",
+                        refs[pr],
+                        "--out",
+                        str(cpu_dir),
+                    ],
+                    cwd=repo,
+                    env=dict(env, PYTHONPATH=str(repo)),
                 )
                 report["cpu"][pr] = {0: "PASS", 1: "FAIL"}.get(proc.returncode, "INCOMPLETE")
         first_tree = trees[next(iter(projects)), False]
@@ -431,7 +527,7 @@ def main(argv=None):
                     report["stages"][key(j)].update(data)
                     write_json(out / "review.json", report)
 
-        for phase in ("engine", "http"):
+        for phase in ("engine", "http", "trace"):
             run_phase(
                 [j for j in jobs if j.phase == phase and j.card in usable],
                 lane,
