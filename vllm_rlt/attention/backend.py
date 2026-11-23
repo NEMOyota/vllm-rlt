@@ -126,14 +126,29 @@ def validate_backend_name(backend: str, *, device_type: str | None = None) -> No
         raise ValueError("unknown attention backend")
 
 
-def _create_explicit(backend, device, dtype, head_dim, block_size, *, packed, packed_window_shape):
+def _create_explicit(
+    backend,
+    device,
+    dtype,
+    head_dim,
+    block_size,
+    *,
+    packed,
+    packed_window_shape,
+    ascend_prefix_prefill_slack=None,
+):
     if backend == "ascend_eager":
         if device.type != "npu" or dtype != torch.bfloat16:
             raise ValueError("ascend_eager requires an NPU and BF16")
         from vllm_rlt.kernels.ascend_attention import AscendAttention
 
         capabilities = BackendCapabilities(packed_prefill=packed, async_scheduling=True)
-        return AttentionBackend(AscendAttention(), capabilities, {"backend": backend})
+        kernel = (
+            AscendAttention()
+            if ascend_prefix_prefill_slack is None
+            else AscendAttention(prefix_prefill_slack=ascend_prefix_prefill_slack)
+        )
+        return AttentionBackend(kernel, capabilities, {"backend": backend})
     if backend == "triton":
         if device.type != "cuda":
             raise ValueError("the Triton attention backend requires a CUDA or ROCm device")
@@ -185,6 +200,7 @@ def create_backend(
     prefer_packed_prefill: bool = False,
     packed_window_shape: PackedWindowShape | None = None,
     allow_fp8_calibration: bool = False,
+    ascend_prefix_prefill_slack: int | None = None,
 ) -> AttentionBackend:
     """Explicit choices fail without fallback; auto tries FA4/3/2, Triton, then Torch.
 
@@ -199,6 +215,11 @@ def create_backend(
     fixed-scale backend. Cache-only callers must provide a resolved scale.
     """
     validate_backend_name(backend, device_type=device.type)
+    if ascend_prefix_prefill_slack is not None and (
+        backend != "ascend_eager"
+        or not (prefer_packed_prefill or required_capabilities.packed_prefill)
+    ):
+        raise ValueError("Ascend prefix prefill grouping requires packed ascend_eager")
     candidates = _AUTO_PRIORITY if backend == "auto" else (backend,)
     skipped = []
     if backend == "auto" and device.type != "cuda":
@@ -214,6 +235,7 @@ def create_backend(
                 block_size,
                 packed=required_capabilities.packed_prefill or prefer_packed_prefill,
                 packed_window_shape=packed_window_shape,
+                ascend_prefix_prefill_slack=ascend_prefix_prefill_slack,
             )
             capabilities = implementation.capabilities
             requirements = required_capabilities

@@ -20,6 +20,13 @@ def add_runtime_args(parser):
     parser.add_argument("--draft-loops", type=int, default=2)
     parser.add_argument("--target-loops", type=int, default=4)
     parser.add_argument("--enable-prefix-caching", action="store_true")
+    parser.add_argument(
+        "--ascend-prefix-prefill-slack",
+        type=int,
+        metavar="TOKENS",
+        help="Group similar packed Ascend prefix-cache prefill shapes within this Q/KV spread. "
+        "Zero groups exact shapes; omit to use normal attention dispatch.",
+    )
     parser.add_argument("--incremental-kv", action="store_true")
     parser.add_argument("--kv-watermark", type=float, default=0.0)
     parser.add_argument("--scheduling-policy", choices=["fcfs", "priority"], default="fcfs")
@@ -134,6 +141,7 @@ def runtime_configs(args):
             else None,
         ),
         execution_config=ExecutionConfig(
+            ascend_prefix_prefill_slack=args.ascend_prefix_prefill_slack,
             packed_prefill=args.packed_prefill,
             use_uva=args.use_uva,
             cuda_graphs=args.cuda_graphs,

@@ -2,10 +2,12 @@
 """Use Torch SDPA on Ascend with the runtime's paged KV cache."""
 
 import weakref
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 
 import torch
 from torch.nn import functional as F
+
+from vllm_rlt.kernels.ascend_prefix_prefill import packed_spans, partition, prepare_group
 
 
 def _attend(query, key, value, mask=None, *, is_causal=False):
@@ -69,7 +71,10 @@ def _prefill_geometry(rows):
 class AscendAttention:
     """Batch compatible queries; borrow only validated host metadata."""
 
-    def __init__(self):
+    def __init__(self, *, prefix_prefill_slack=None):
+        self.prefix_prefill_slack = prefix_prefill_slack
+        self.prefix_group_stats = Counter()
+        self._prefix_groups = ()
         self._metadata = None
         self._groups = None
         self._geometry = None
@@ -165,6 +170,16 @@ class AscendAttention:
         result[:rows].copy_(output)
         return result
 
+    @staticmethod
+    def _single_group(table_row, rows, lengths, device):
+        maximum = max(lengths)
+        indices = torch.tensor(rows, dtype=torch.long, device=device)
+        positions = torch.arange(maximum, device=device)
+        initial = len(lengths) == maximum and all(n == i for i, n in enumerate(lengths, 1))
+        row_lengths = torch.tensor(lengths, device=device)
+        mask = positions[None, :] < row_lengths[:, None] if not initial and len(rows) > 1 else None
+        return table_row, indices, positions, mask, initial, row_lengths
+
     def _plan(self, sequence_keys, lengths, device, *, packed=False):
         grouped = {}
         for row, (key, length) in enumerate(zip(sequence_keys, lengths, strict=True)):
@@ -172,20 +187,51 @@ class AscendAttention:
                 grouped.setdefault(key, []).append(row)
         planned = []
         for sequence, rows in enumerate(grouped.values()):
-            maximum = max(lengths[row] for row in rows)
-            indices = torch.tensor(rows, dtype=torch.long, device=device)
-            positions = torch.arange(maximum, device=device)
             group_lengths = [lengths[row] for row in rows]
-            initial = group_lengths == list(range(1, maximum + 1))
-            row_lengths = torch.tensor(group_lengths, device=device)
-            mask = (
-                positions[None, :] < row_lengths[:, None] if not initial and len(rows) > 1 else None
-            )
             # Packed table rows follow sequence order. Query indices still
             # address the flattened Q and output tensors.
             table_row = sequence if packed else rows[0]
-            planned.append((table_row, indices, positions, mask, initial, row_lengths))
+            planned.append(self._single_group(table_row, rows, group_lengths, device))
         return planned
+
+    def _plan_prefix(self, q, keys, batch, flat_rows, stream):
+        merged, singles = partition(
+            packed_spans(batch.rows),
+            self.prefix_prefill_slack,
+            q_row_bytes=q.shape[1] * q.shape[2] * q.element_size(),
+            kv_row_bytes=keys.shape[-2] * keys.shape[-1] * keys.element_size(),
+        )
+        self._prefix_groups = [
+            prepare_group(
+                members, batch.block_tables, keys.shape[1], flat_rows[2], self._layout, stream
+            )
+            for members in merged
+        ]
+        return [
+            self._single_group(
+                s.table,
+                range(s.offset, s.offset + s.width),
+                range(s.start + 1, s.context + 1),
+                q.device,
+            )
+            for s in singles
+        ]
+
+    def _attend_prefix(self, q, flat_rows, result):
+        flat_keys, flat_values, _ = flat_rows
+        for group in self._prefix_groups:
+            kv_shape = (group.size, -1, *flat_keys.shape[1:])
+            key = flat_keys.index_select(0, group.slots).reshape(kv_shape).transpose(1, 2)
+            value = flat_values.index_select(0, group.slots).reshape(kv_shape).transpose(1, 2)
+            query = q.index_select(0, group.query_rows).view(group.size, group.width, *q.shape[1:])
+            output = _attend(
+                query.transpose(1, 2), key, value, group.mask, is_causal=group.mask is None
+            )
+            output = output.transpose(1, 2).reshape(-1, *q.shape[1:])
+            if group.keep is not None:
+                output = output.index_select(0, group.keep)
+            result.index_copy_(0, group.output_rows, output)
+            self.prefix_group_stats.update(group.work)
 
     def _forward(self, q, keys, values, tables, groups, *, flat_rows=None, result=None):
         if result is None:
@@ -286,6 +332,7 @@ class AscendAttention:
             self._write_slots = None
             self._ragged_plan = None
             self._decode_plan = None
+            self._prefix_groups = ()
             self._direct_decode = (
                 flat_rows is not None
                 and len(batch.rows) >= 2
@@ -295,6 +342,13 @@ class AscendAttention:
             self._groups = None
             if self._direct_decode:
                 self._prepare_decode(q, keys, batch, flat_rows, stream)
+            elif (
+                self.prefix_prefill_slack is not None
+                and packed
+                and flat_rows is not None
+                and self._geometry is None
+            ):
+                self._groups = self._plan_prefix(q, keys, batch, flat_rows, stream)
             elif flat_rows is None or self._geometry is None:
                 self._groups = self._plan(
                     [(id(allocation), depth) for allocation, depth, _ in batch.rows],
@@ -324,6 +378,8 @@ class AscendAttention:
             remaining.extend(ragged)
             ragged = []
         result = self._forward(q, keys, values, batch.block_tables, remaining, flat_rows=flat_rows)
+        if self._prefix_groups:
+            self._attend_prefix(q, flat_rows, result)
         if ragged:
             self.ragged_calls += 1
             result = self._ragged_decode(

@@ -75,6 +75,17 @@ class StageEngine:
         self.execution_config = resolve_cuda_graph_rows(
             execution_config or ExecutionConfig(), scheduler_config, speculative_config
         )
+        slack = self.execution_config.ascend_prefix_prefill_slack
+        if slack is not None and (
+            parameter.device.type != "npu"
+            or attention_backend != "ascend_eager"
+            or not cache_config.enable_prefix_caching
+            or self.execution_config.packed_prefill is False
+        ):
+            raise ValueError(
+                "Ascend prefix prefill grouping requires packed ascend_eager on NPU "
+                "with prefix caching"
+            )
         staged_prefill = requires_staged_prefill(
             scheduler_config, produces_tokens=self.stage_config.produces_tokens
         )
@@ -255,6 +266,7 @@ class StageEngine:
                 sliding_window=sliding_window,
             ),
             prefer_packed_prefill=prefer_packed and not sliding_window,
+            ascend_prefix_prefill_slack=slack,
             packed_window_shape=packed_window_shape,
             allow_fp8_calibration=True,
         )

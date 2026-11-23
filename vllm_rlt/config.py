@@ -160,8 +160,14 @@ class ExecutionConfig:
     # ordinary (non-staged) prefill. Sliding windows additionally require packed-window
     # support and compatible synchronous eager execution; off otherwise.
     packed_prefill: bool | None = None
+    # Ascend prefix-cache SDPA grouping, measured in both Q rows and KV tokens.
+    # None preserves normal dispatch. Zero admits exact shapes only.
+    ascend_prefix_prefill_slack: int | None = None
 
     def __post_init__(self):
+        slack = self.ascend_prefix_prefill_slack
+        if slack is not None and (type(slack) is not int or slack < 0):
+            raise ValueError("ascend_prefix_prefill_slack must be a nonnegative integer or None")
         if self.packed_prefill is not None and type(self.packed_prefill) is not bool:
             raise ValueError("packed_prefill must be a boolean or None")
         for name in (
