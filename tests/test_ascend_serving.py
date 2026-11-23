@@ -16,17 +16,24 @@ pytestmark = pytest.mark.npu
 
 
 @pytest.mark.parametrize(
-    ("backend", "asynchronous"),
-    [("torch", False), ("ascend_eager", False), ("ascend_eager", True)],
-    ids=["torch-sync", "ascend-sync", "ascend-async"],
+    ("backend", "asynchronous", "prefix"),
+    [
+        ("torch", False, False),
+        ("ascend_eager", False, False),
+        ("ascend_eager", True, False),
+        ("ascend_eager", False, True),
+    ],
+    ids=["torch-sync", "ascend-sync", "ascend-async", "ascend-prefix"],
 )
-def test_checkpoint_http_completions_stream_and_disconnect(tmp_path, backend, asynchronous):
+def test_checkpoint_http_completions_stream_and_disconnect(tmp_path, backend, asynchronous, prefix):
     import aiohttp
 
     source = os.environ.get("VLLM_RLT_OURO_CHECKPOINT")
     if not source:
         pytest.skip("set VLLM_RLT_OURO_CHECKPOINT to the pinned local Ouro-1.4B checkpoint")
     mode = backend + ("-async" if asynchronous else "-sync")
+    if prefix:
+        mode += "-prefix"
     folder = Path(os.environ.get("VLLM_RLT_ASCEND_RESULTS", tmp_path)) / mode
     folder.mkdir(parents=True, exist_ok=True)
     with socket.socket() as listener:
@@ -47,14 +54,24 @@ def test_checkpoint_http_completions_stream_and_disconnect(tmp_path, backend, as
         "--attention-backend",
         backend,
         "--num-blocks",
-        "64",
+        "128" if prefix else "64",
         "--max-num-seqs",
         "2",
         "--max-num-batched-tokens",
-        "32",
+        "256" if prefix else "32",
         "--port",
         str(port),
     ]
+    if prefix:
+        command.extend(
+            [
+                "--enable-prefix-caching",
+                "--single-stream",
+                "--no-uva",
+                "--prefill-chunk-size",
+                "128",
+            ]
+        )
     if asynchronous:
         command.extend(["--async-scheduling", "--exit-mode", "ouro_delayed", "--single-stream"])
     with (folder / "service.log").open("w") as log:
@@ -98,6 +115,13 @@ def test_checkpoint_http_completions_stream_and_disconnect(tmp_path, backend, as
                         return result
 
                 prompts = ["The capital of France is", "One plus one equals"]
+                if prefix:
+                    # The standalone service returns usage/text. The paired audit in
+                    # the validation suite independently checks the worker's hit counter.
+                    shared = "Read the following warranty terms carefully. " * 6
+                    donor = await complete(shared + "List all terms.")
+                    assert donor["usage"]["prompt_tokens"] > 2 * 16
+                    prompts = [shared + "Who is covered?", shared + "How long is the warranty?"]
                 normal = await asyncio.gather(*(complete(prompt) for prompt in prompts))
                 events = []
                 async with client.post(
