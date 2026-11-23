@@ -34,13 +34,21 @@ def test_release_assignments_and_rounds(cards):
 def test_coverage_detects_repeat_and_missing_measurements(tmp_path):
     job = next(j for j in driver.plan(["pr2"], [0]) if j.phase == "http")
     rows = [
-        dict(kind="SERVICE_RUN", round=n, mode=m)
+        dict(kind="SERVICE_RUN", round=n, mode=m, precision="native_bf16", linear_fp32_chunk=None)
         for n in (1, 2, 3)
         for m in ("main", "exact", "similar")
     ]
+    for row in rows:
+        folder = tmp_path / f"round-{row['round']}-{row['mode']}"
+        folder.mkdir()
+        (folder / "opportunities.json").write_text("{}")
     raw = tmp_path / "raw.jsonl"
     raw.write_text("".join(json.dumps(row) + "\n" for row in rows))
     driver.check_rounds(job, tmp_path)
+    rows[-1]["precision"] = "native_fp16"
+    raw.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    with pytest.raises(ValueError, match="wrong precision"):
+        driver.check_rounds(job, tmp_path)
     rows[-1] = rows[0]
     raw.write_text("".join(json.dumps(row) + "\n" for row in rows))
     with pytest.raises(ValueError, match="round coverage"):

@@ -23,6 +23,7 @@ import torch
 
 from benchmarks.ascend_main_prefix_linear import (
     add_precision_arg,
+    benchmark_dtype,
     check_linear_usage,
     linear_usage,
     padded_fp32_linears,
@@ -187,8 +188,12 @@ def run_arm(model, case, arm, primer, targets):
             "expected mainline packed ascend_eager",
         )
         require(
-            cache._prepared_coverage is not None and cache.dtype == torch.bfloat16,
-            "expected BF16 and Ascend range bookkeeping",
+            cache._prepared_coverage is not None
+            and cache.dtype
+            == cache.key_cache.dtype
+            == cache.value_cache.dtype
+            == model.lm_head.weight.dtype,
+            "expected model dtype in KV and Ascend range bookkeeping",
         )
         params = SamplingParams(
             max_tokens=OUTPUTS,
@@ -293,7 +298,7 @@ def environment(device, *, dtype=torch.bfloat16):
 
 
 def run_model_cases(model, args, names, record, location, oracle_failed):
-    settings = precision_settings(args.linear_fp32_chunk)
+    settings = precision_settings(args.linear_fp32_chunk, dtype=model.lm_head.weight.dtype)
     parity_failed, controls_failed, repeat_drift = set(), set(), set()
     location.update(phase="install_linears", **settings)
     with padded_fp32_linears(model, args.linear_fp32_chunk) as work:
@@ -414,18 +419,19 @@ def main(argv=None):
         try:
             device = resolve_device("npu:0")
             torch.npu.set_device(device)
+            dtype = benchmark_dtype()
             matmul = getattr(torch.npu, "matmul", None)
             record(
                 "COMBO_ENV",
-                **environment(device),
+                **environment(device, dtype=dtype),
                 cases=names,
                 repeats=args.repeats,
-                **precision_settings(args.linear_fp32_chunk),
+                **precision_settings(args.linear_fp32_chunk, dtype=dtype),
                 native_allow_hf32=getattr(matmul, "allow_hf32", None),
             )
             location = dict(phase="page_oracle")
             attention = create_backend(
-                "ascend_eager", device, torch.bfloat16, 64, BLOCK, prefer_packed_prefill=True
+                "ascend_eager", device, dtype, 64, BLOCK, prefer_packed_prefill=True
             )
             probe = KVCacheManager(
                 2,
@@ -435,7 +441,7 @@ def main(argv=None):
                 BLOCK,
                 4,
                 device=device,
-                dtype=torch.bfloat16,
+                dtype=dtype,
                 attention=attention,
                 enable_prefix_caching=True,
             )
@@ -448,10 +454,14 @@ def main(argv=None):
                 record("COMBO_ORACLE", status="FAIL", detail=str(exc))
             del probe
             location = dict(phase="checkpoint")
-            record("COMBO_CHECKPOINT", echo=False, files=checkpoint_identity(args.model))
-            model = OuroForCausalLM.from_pretrained(
-                args.model, device=device, dtype=torch.bfloat16
-            ).eval()
+            record(
+                "COMBO_CHECKPOINT",
+                echo=False,
+                files=json.loads(Path(identity).read_text())
+                if (identity := os.getenv("RLT_BENCH_CHECKPOINT_JSON"))
+                else checkpoint_identity(args.model),
+            )
+            model = OuroForCausalLM.from_pretrained(args.model, device=device, dtype=dtype).eval()
             return run_model_cases(model, args, names, record, location, oracle_failed)
         except Exception as exc:
             record("COMBO_ERROR", **location, error=type(exc).__name__, detail=str(exc))
@@ -459,7 +469,7 @@ def main(argv=None):
                 "COMBO_REVIEW",
                 status="INCOMPLETE",
                 stopped_at=location,
-                **precision_settings(args.linear_fp32_chunk),
+                **precision_settings(args.linear_fp32_chunk, dtype=dtype),
                 failed=sorted(failed_so_far),
             )
             traceback.print_exc()
