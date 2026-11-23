@@ -114,8 +114,10 @@ def prompts(case, vocab):
     return donor, miss, targets
 
 
-def open_engine(model, case, arm, *, prefix_prefill_slack=None):
+def open_engine(model, case, arm, *, token_budget=None, prefix_prefill_slack=None):
     capacity = case.prefix + case.suffix + OUTPUTS - 1
+    if token_budget is None:
+        token_budget = case.count * capacity
     blocks = 4 * math.ceil(capacity / BLOCK) * (case.count if case.tight_pool else case.count + 1)
     execution = ExecutionConfig(multi_stream=False, use_uva=False)
     if prefix_prefill_slack is not None:
@@ -129,7 +131,7 @@ def open_engine(model, case, arm, *, prefix_prefill_slack=None):
         scheduler_config=SchedulerConfig(
             max_num_seqs=case.count,
             prefill_chunk_size=capacity,
-            max_num_batched_tokens=case.count * capacity,
+            max_num_batched_tokens=token_budget,
         ),
         execution_config=execution,
     )
@@ -256,7 +258,7 @@ def token_diffs(reference, actual, comparison):
     return diffs
 
 
-def environment(device):
+def environment(device, *, dtype=torch.bfloat16):
     import torch_npu
 
     root = Path(__file__).resolve().parents[1]
@@ -288,7 +290,7 @@ def environment(device):
         block_size=BLOCK,
         output_tokens=OUTPUTS,
         loops=4,
-        dtype="bfloat16",
+        dtype=str(dtype).removeprefix("torch.") if dtype is not None else None,
         execution="sync ascend_eager, mainline default packing, no experimental subgroup batching",
     )
 

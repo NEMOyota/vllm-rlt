@@ -22,7 +22,11 @@ from uuid import uuid4
 import aiohttp
 
 from benchmarks.ascend_main_prefix_combo import BLOCK, SEED
-from benchmarks.ascend_main_prefix_linear import add_precision_arg, check_linear_usage
+from benchmarks.ascend_main_prefix_linear import (
+    add_precision_arg,
+    benchmark_dtype,
+    check_linear_usage,
+)
 from benchmarks.ascend_main_prefix_results import Report, ids_digest, quantiles, savings, write_csv
 from benchmarks.ascend_prefix_combo_checks import require
 from benchmarks.ascend_prefix_opportunities import opportunities
@@ -276,8 +280,8 @@ def reconcile(mode, primers, plan, rows, audit, *, linear_fp32_chunk=None, pr2_s
     require(
         state.get("backend") == "ascend_eager"
         and state["packed"]
-        and state["dtype"] == "torch.bfloat16"
-        and state["linear_weight_dtypes"] == ["torch.bfloat16"]
+        and state["dtype"] == str(benchmark_dtype())
+        and state["linear_weight_dtypes"] == [str(benchmark_dtype())]
         and not state["async_scheduling"]
         and not state["multi_stream"]
         and state["prefix_enabled"] == (mode != "off")
@@ -379,7 +383,7 @@ def summary(rows, wall):
 async def run_mode(args, report, mode, n, primers, plan, num_blocks, width):
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
+        port = int(os.environ.get("RLT_BENCH_PORT") or sock.getsockname()[1])
     folder = report.folder / f"round-{n}-{mode}"
     folder.mkdir()
     url = f"http://127.0.0.1:{port}"
@@ -396,7 +400,7 @@ async def run_mode(args, report, mode, n, primers, plan, num_blocks, width):
         "--device",
         "npu",
         "--dtype",
-        "bfloat16",
+        str(benchmark_dtype()).removeprefix("torch."),
         "--attention-backend",
         "ascend_eager",
         "--single-stream",
@@ -424,11 +428,12 @@ async def run_mode(args, report, mode, n, primers, plan, num_blocks, width):
         command.extend(
             ["--ascend-prefix-prefill-slack", str(0 if mode == "exact" else args.pr2_slack)]
         )
+    collect = args.observe_prefill or getattr(args, "collect_opportunities", False)
     env = dict(
         os.environ,
         RLT_BENCH_ATTENTION="grouped" if mode == "grouped" else "main",
         RLT_BENCH_AUDIT=str(audit.resolve()),
-        RLT_BENCH_PREFILL_STEPS="1" if args.observe_prefill else "0",
+        RLT_BENCH_PREFILL_STEPS="1" if collect else "0",
         RLT_BENCH_LINEAR_FP32_CHUNK=str(args.linear_fp32_chunk) if args.linear_fp32_chunk else "",
     )
     async with aiohttp.ClientSession(
@@ -454,7 +459,7 @@ async def run_mode(args, report, mode, n, primers, plan, num_blocks, width):
         pr2_slack=getattr(args, "pr2_slack", None),
     )
     stats = summary(rows, wall)
-    if args.observe_prefill:
+    if collect:
         counts = opportunities(
             captured["prefill_steps"], plan, row_bytes=captured["state"].get("attention_row_bytes")
         )
@@ -587,7 +592,7 @@ async def exercise(args, report):
             if mode in first:
                 diffs.extend(service_diffs(first[mode], rows, f"{mode}_vs_first", i + 1))
             else:
-                first[mode] = rows
+                first.setdefault(mode, rows)
             runs[mode] = rows
             if mode == "grouped":
                 grouped_calls.append(s["group_calls"])
@@ -657,9 +662,21 @@ async def exercise(args, report):
         "FAIL" if errors or diffs else "PASS",
         requests_per_mode=args.requests,
         rounds=args.rounds,
+        correctness_rounds=getattr(args, "correctness_rounds", args.rounds),
         modes=list(modes),
         diagnostic_replay=args.observe_prefill,
+        opportunities_collected=getattr(args, "collect_opportunities", False)
+        or args.observe_prefill,
         control_issues=len(errors),
+        correctness_status=(
+            "FAIL"
+            if any(
+                r["round"] <= getattr(args, "correctness_rounds", args.rounds)
+                for r in errors + diffs
+            )
+            else "PASS"
+        ),
+        performance_valid=not (errors or diffs),
         output_diffs=len(diffs),
         examples=(errors + diffs)[:6],
         grouped_calls_per_round=grouped_calls,
@@ -680,6 +697,10 @@ def main(argv=None):
         default=0,
         help="Offered Poisson arrivals/s; 0 offers a burst with bounded client concurrency",
     )
+    p.add_argument(
+        "--collect-opportunities", action="store_true", help="Observe all timed modes symmetrically"
+    )
+    p.add_argument("--correctness-rounds", type=int)
     p.add_argument("--rounds", type=int, default=2)
     p.add_argument(
         "--pr2-slack", type=int, help="Compare cache-on main/exact/similar via the stock CLI"
@@ -705,6 +726,10 @@ def main(argv=None):
         help="Record per-step geometry in a diagnostic replay; exclude latency comparisons",
     )
     args = p.parse_args(argv)
+    if args.correctness_rounds is None:
+        args.correctness_rounds = args.rounds
+    if not 1 <= args.correctness_rounds <= args.rounds:
+        p.error("correctness rounds must fit within measured rounds")
     if (
         not args.model.is_dir()
         or (args.pr2_slack is not None and (args.pr2_slack <= 0 or args.main_only))

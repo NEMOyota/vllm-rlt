@@ -7,7 +7,11 @@ import torch
 
 from benchmarks import ascend_main_prefix_combo as combo
 from benchmarks import ascend_main_prefix_matrix as matrix
-from benchmarks.ascend_main_prefix_linear import add_precision_arg, padded_fp32_linears
+from benchmarks.ascend_main_prefix_linear import (
+    add_precision_arg,
+    benchmark_dtype,
+    padded_fp32_linears,
+)
 from benchmarks.ascend_main_prefix_results import Report, ids_digest, savings
 from benchmarks.ascend_prefix_combo_checks import require
 from benchmarks.ascend_prefix_pr1_diagnostics import capture_context, checked_profile_files
@@ -84,30 +88,30 @@ def evaluate(model, args, report):
             )
             first, times, differences = {}, {mode: [] for mode in MODES}, []
 
-            def check(mode, out, round_id):
-                references = [(mode + "_vs_first", first.get(mode))]
-                if mode != "main":
-                    references.append(("main_vs_" + mode, first.get("main")))
-                if mode == "similar":
-                    references.append(("exact_vs_similar", first.get("exact")))
-                for label, base in references:
-                    if base is not None:
-                        differences.extend(
-                            dict(round=round_id, **d) for d in combo.token_diffs(base, out, label)
-                        )
-                first.setdefault(mode, out)
+            def compare(label, base, row, round_id):
+                differences.extend(
+                    dict(round=round_id, **diff) for diff in combo.token_diffs(base, row, label)
+                )
 
-            repeats = 1 if args.profile else args.repeats + 1
-            for i in range(repeats):
+            start = 0 if getattr(args, "warmups", 1) or args.profile else 1
+            stop = 1 if args.profile else args.repeats + 1
+            for i in range(start, stop):
                 modes = list(MODES)
-                order = modes[i % 3 :] + modes[: i % 3]
+                offset = (i - start) % len(modes)
+                order = modes[offset:] + modes[:offset]
+                runs = {}
                 for mode in order:
                     report.location = dict(case=name, mode=mode, round=i)
                     row = run_trial(model, name, mode, inputs, case, linear_work)
+                    runs[mode] = row
                     report.record("TRIAL", **report.location, warmup=i == 0, **row)
-                    check(mode, row, i)
+                    if mode in first:
+                        compare(mode + "_vs_first", first[mode], row, i)
+                    first.setdefault(mode, row)
                     if i:
                         times[mode].append(matrix.metrics([row])["ttft_ms"]["p50"])
+                for a, b in (("main", "exact"), ("main", "similar"), ("exact", "similar")):
+                    compare(a + "_vs_" + b, runs[a], runs[b], i)
             if args.profile:
                 for full in (False, True):
                     for mode in MODES:
@@ -123,7 +127,7 @@ def evaluate(model, args, report):
                             linear_work,
                             capture_context(folder, full),
                         )
-                        check(mode, row, folder.name)
+                        compare(mode + "_vs_first", first[mode], row, folder.name)
                         artifacts = checked_profile_files(folder, full)
                         actual = artifacts["cpu_operators"].get(
                             "aten::scaled_dot_product_attention"
@@ -149,7 +153,21 @@ def evaluate(model, args, report):
             if not differences and not args.profile:
                 for before, after in (("main", "exact"), ("main", "similar"), ("exact", "similar")):
                     paired[f"{before}_to_{after}"] = savings(times[before], times[after])
-            report.record("CASE", echo=True, case=name, differences=differences, paired_ttft=paired)
+            formal = [
+                d
+                for d in differences
+                if isinstance(d["round"], int)
+                and 1 <= d["round"] <= getattr(args, "correctness_rounds", args.repeats)
+            ]
+            report.record(
+                "CASE",
+                echo=True,
+                case=name,
+                differences=differences,
+                paired_ttft=paired,
+                correctness_status="FAIL" if formal else "PASS",
+                performance_valid=not differences,
+            )
             if differences:
                 failed.append(name)
     return report.review("FAIL" if failed else "PASS", failed=failed, profile=args.profile)
@@ -160,6 +178,8 @@ def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model", type=Path, required=True)
     p.add_argument("--out-dir", type=Path)
+    p.add_argument("--warmups", type=int, choices=(0, 1), default=1)
+    p.add_argument("--correctness-rounds", type=int)
     p.add_argument("--repeats", type=int, default=3)
     p.add_argument("--case", choices=CASES, action="append")
     p.add_argument(
@@ -169,13 +189,17 @@ def main(argv=None):
     )
     add_precision_arg(p)
     args = p.parse_args(argv)
+    if args.correctness_rounds is None:
+        args.correctness_rounds = args.repeats
+    if not 1 <= args.correctness_rounds <= args.repeats:
+        p.error("correctness rounds must fit within measured rounds")
     if not args.model.is_dir() or args.repeats < 1:
         p.error("provide a local model and at least one repetition")
     report = Report("PREFIX_GROUPS", args.out_dir, linear_fp32_chunk=args.linear_fp32_chunk)
 
     def run(args, device, report):
         model = OuroForCausalLM.from_pretrained(
-            args.model, device=device, dtype=torch.bfloat16
+            args.model, device=device, dtype=benchmark_dtype()
         ).eval()
         try:
             return evaluate(model, args, report)

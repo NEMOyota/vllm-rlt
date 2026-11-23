@@ -154,7 +154,9 @@ class PrefillAudit:
 
         def observe_sdpa(q, k, v, *args, **kwargs):
             require(
-                all(t.dtype == torch.bfloat16 and t.device == self.cache.device for t in (q, k, v)),
+                all(
+                    t.dtype == self.cache.dtype and t.device == self.cache.device for t in (q, k, v)
+                ),
                 "unexpected SDPA device or dtype",
             )
             self.check_mask(

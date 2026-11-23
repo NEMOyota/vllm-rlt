@@ -1,4 +1,4 @@
-"""Separate numerical and device-profile replays of the native BF16 PR1 path."""
+"""Numerical replay of PR1 cache arms and device profiles of native BF16."""
 
 import argparse
 import csv
@@ -7,15 +7,22 @@ import json
 import platform
 import shutil
 import subprocess
+import traceback
 from collections import Counter, defaultdict
 from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import patch
 
 import torch
+import torch.nn.functional as F
 
 from benchmarks import ascend_main_prefix_combo as combo
 from benchmarks import ascend_main_prefix_matrix as matrix
+from benchmarks.ascend_main_prefix_linear import (
+    add_precision_arg,
+    padded_fp32_linears,
+    precision_settings,
+)
 from benchmarks.ascend_main_prefix_results import ids_digest
 from benchmarks.ascend_prefix_combo_checks import require
 from benchmarks.preemption import checkpoint_identity
@@ -32,10 +39,18 @@ def save(path, data):
     path.write_text(json.dumps(data, indent=2, allow_nan=False) + "\n")
 
 
-def trace_logits(model, case, inputs, arm):
+def trace_logits(model, case, inputs, arm, *, linear_work=None):
     """Bind LM-head rows to the actual CODA spans in this synchronous replay only."""
     records = defaultdict(list)
     execute = ModelRunner._execute_batch
+    dtype = model.lm_head.weight.dtype
+    sdpa = F.scaled_dot_product_attention
+    attention_dtypes = Counter()
+
+    def observed_sdpa(q, k, v, *args, **kwargs):
+        output = sdpa(q, k, v, *args, **kwargs)
+        attention_dtypes[q.dtype, k.dtype, v.dtype, output.dtype] += 1
+        return output
 
     def observed(runner, batch, prepared):
         if batch.operation != Operation.CODA:
@@ -45,6 +60,7 @@ def trace_logits(model, case, inputs, arm):
         def capture(_module, arguments, values):
             hidden = arguments[0]
             require(len(values) == len(hidden) == len(ids), "unexpected CODA row layout")
+            require(hidden.dtype == values.dtype == dtype, "unexpected LM head activation dtype")
             for rid, vector, scores in zip(ids, hidden, values, strict=True):
                 if rid in inputs[2]:
                     records[rid].append(
@@ -54,11 +70,44 @@ def trace_logits(model, case, inputs, arm):
         with model.lm_head.register_forward_hook(capture):
             return execute(runner, batch, prepared)
 
-    with patch.object(ModelRunner, "_execute_batch", observed):
-        result = matrix.trial(model, case, "main", arm, inputs)
+    with (
+        patch.object(ModelRunner, "_execute_batch", observed),
+        patch.object(F, "scaled_dot_product_attention", observed_sdpa),
+    ):
+        result = matrix.trial(
+            model, case, "main", arm, inputs, linear_work=linear_work, dtype=dtype
+        )
+    require(set(attention_dtypes) == {(dtype,) * 4}, f"unexpected SDPA dtypes: {attention_dtypes}")
+    (q, k, v, output), calls = next(iter(attention_dtypes.items()))
+    result["observed_dtypes"] = dict(
+        model_weights=str(dtype),
+        key_cache=result["key_cache_dtype"],
+        value_cache=result["value_cache_dtype"],
+        sdpa_q=str(q),
+        sdpa_k=str(k),
+        sdpa_v=str(v),
+        sdpa_output=str(output),
+        sdpa_calls=calls,
+    )
     for rid, row in result["requests"].items():
-        selected = [int(scores.argmax()) for _, scores in records[rid]]
-        require(selected == row["tokens"], f"logits do not match returned IDs for {rid}")
+        require(
+            row["prefill_rows"] == len(inputs[2][rid]) - row["hit_tokens"],
+            f"{arm} {rid}: first prefill did not cover the expected suffix",
+        )
+        # A device can select a different tied maximum from a CPU argmax. Use
+        # the device's returned IDs for parity and its captured scores as evidence.
+        steps = zip(records[rid], row["tokens"], strict=True)
+        for pos, ((hidden, scores), token) in enumerate(steps, 1):
+            if dtype == torch.float16 and not (
+                torch.isfinite(hidden).all() and torch.isfinite(scores).all()
+            ):
+                raise FloatingPointError(
+                    f"{arm} {rid} token {pos}: non-finite FP16 hidden or logits"
+                )
+            require(
+                scores[token] == scores.max(),
+                f"{arm} {rid} token {pos}: captured logits do not support the returned greedy ID",
+            )
     return result, records
 
 
@@ -72,13 +121,15 @@ def margin(scores, tokens):
     )
 
 
-def diagnose_case(model, name):
+def diagnose_case(model, name, *, linear_work=None):
     case = matrix.FULL[name]
     inputs = combo.workload(case, model.config.vocab_size)
-    baseline, reference = trace_logits(model, case, inputs, "off")
+    baseline, reference = trace_logits(model, case, inputs, "off", linear_work=linear_work)
+    trials = {"off": baseline}
     differences = []
     for arm in ("miss", "reuse"):
-        current, observed = trace_logits(model, case, inputs, arm)
+        current, observed = trace_logits(model, case, inputs, arm, linear_work=linear_work)
+        trials[arm] = current
         for diff in combo.token_diffs(baseline, current, f"off_vs_{arm}"):
             rid, pos = diff["request"], diff["first_diff_1based"] - 1
             history = baseline["requests"][rid]["tokens"][:pos]
@@ -87,7 +138,7 @@ def diagnose_case(model, name):
             right_hidden, right_scores = observed[rid][pos]
             tokens = [diff["expected"], diff["actual"]]
             # Independent dot products for just the two selected tokens and both
-            # native hidden rows. This isolates the head, not all upstream layers.
+            # observed hidden rows. This isolates the head, not all upstream layers.
             head = model.lm_head
             idx = torch.tensor(tokens, device=head.weight.device)
             weights = head.weight.index_select(0, idx).detach().cpu().double()
@@ -109,7 +160,57 @@ def diagnose_case(model, name):
                     candidate_head_fp64_pair=(weights @ right_hidden.double() + bias).tolist(),
                 )
             )
-    return dict(case=name, differences=differences)
+    arms = {}
+    for arm, trial in trials.items():
+        requests = {}
+        for rid, row in trial["requests"].items():
+            requests[rid] = {key: row[key] for key in ("hit_tokens", "prefill_rows", "tokens")}
+        arms[arm] = {"requests": requests, "observed_dtypes": trial["observed_dtypes"]}
+        if linear_work is not None:
+            arms[arm]["linear_work"] = trial["linear_work"]
+    return dict(
+        case=name,
+        primer_ids={"off_and_reuse": inputs[0], "miss": inputs[1]},
+        target_prompt_ids=inputs[2],
+        arms=arms,
+        differences=differences,
+    )
+
+
+def run_drift(model, names, out, chunk):
+    names = list(dict.fromkeys(names))
+    settings = precision_settings(chunk, dtype=next(model.parameters()).dtype)
+    results = {}
+    count = 0
+    with padded_fp32_linears(model, chunk) as work:
+        for name in names:
+            try:
+                row = diagnose_case(model, name, linear_work=work)
+            except (AssertionError, ValueError, RuntimeError, FloatingPointError) as exc:
+                traceback.print_exc()
+                status = "FAIL" if isinstance(exc, FloatingPointError) else "INCOMPLETE"
+                summary = dict(status=status, detail=f"{type(exc).__name__}: {exc}")
+                row = {"case": name}
+            else:
+                diffs = row["differences"]
+                count += len(diffs)
+                by_pair = Counter(diff["comparison"] for diff in diffs)
+                summary = dict(
+                    status="FAIL" if diffs else "PASS",
+                    requests=len(row["target_prompt_ids"]),
+                    off_vs_miss=by_pair["off_vs_miss"],
+                    off_vs_reuse=by_pair["off_vs_reuse"],
+                )
+            results[name] = summary
+            save(out / f"{name}.json", {**settings, **row, **summary})
+            print(name, summary, flush=True)
+    statuses = {row["status"] for row in results.values()}
+    status = "INCOMPLETE" if "INCOMPLETE" in statuses else "FAIL" if "FAIL" in statuses else "PASS"
+    save(
+        out / "review.json",
+        dict(**settings, cases=names, results=results, differences=count, status=status),
+    )
+    return {"INCOMPLETE": 2, "FAIL": 1, "PASS": 0}[status]
 
 
 def checked_profile_files(folder, full):
@@ -227,16 +328,25 @@ def main():
     p.add_argument("--out", required=True, type=Path)
     p.add_argument("--matrix", type=Path, help="Also diagnose failures found by this BF16 matrix")
     p.add_argument("--case", choices=matrix.FULL, action="append")
+    p.add_argument("--dtype", choices=("bfloat16", "float16"), default="bfloat16")
+    add_precision_arg(p)
     args = p.parse_args()
+    if args.linear_fp32_chunk is not None and args.task != "drift":
+        p.error("--linear-fp32-chunk applies to drift replays")
+    if args.dtype == "float16" and (args.task != "drift" or args.linear_fp32_chunk is not None):
+        p.error("--dtype float16 requires a native drift replay with no FP32 Linear override")
+    dtype = getattr(torch, args.dtype)
     args.out.mkdir(parents=True, exist_ok=False)
     device = resolve_device("npu:0")
     torch.npu.set_device(device)
-    env = combo.environment(device)
+    env = combo.environment(device, dtype=None if args.task == "env" else dtype)
     env.update(
         python=platform.python_version(),
         system=platform.platform(),
         allow_hf32=getattr(getattr(torch.npu, "matmul", None), "allow_hf32", None),
     )
+    if args.task != "env":
+        env.update(precision_settings(args.linear_fp32_chunk, dtype=dtype))
     save(args.out / "environment.json", env)
     if args.task == "env":
         identity = checkpoint_identity(args.model)
@@ -251,21 +361,13 @@ def main():
                     ["npu-smi", "info"], stdout=log, stderr=subprocess.STDOUT, timeout=30
                 )
         return 0
-    model = OuroForCausalLM.from_pretrained(args.model, device=device, dtype=torch.bfloat16).eval()
-    require(
-        all(param.dtype == torch.bfloat16 for param in model.parameters()), "expected BF16 weights"
-    )
+    model = OuroForCausalLM.from_pretrained(args.model, device=device, dtype=dtype).eval()
+    require(all(param.dtype == dtype for param in model.parameters()), f"expected {dtype} weights")
     if args.task == "drift":
         names = list(args.case or KNOWN)
         if args.matrix and args.matrix.is_file():
             names.extend(json.loads(args.matrix.read_text()).get("failed", []))
-        count = 0
-        for name in dict.fromkeys(names):
-            row = diagnose_case(model, name)
-            save(args.out / f"{name}.json", row)
-            count += len(row["differences"])
-        save(args.out / "review.json", dict(cases=list(dict.fromkeys(names)), differences=count))
-        return int(count > 0)
+        return run_drift(model, names, args.out, args.linear_fp32_chunk)
 
     name = (args.case or ["p512_s8"])[0]
     case = matrix.FULL[name]

@@ -14,6 +14,7 @@ from benchmarks.ascend_main_prefix_combo import ARMS, BLOCK, OUTPUTS, Case
 from benchmarks.ascend_main_prefix_grouping import attention_mode, group_counts
 from benchmarks.ascend_main_prefix_linear import (
     add_precision_arg,
+    benchmark_dtype,
     check_linear_usage,
     linear_usage,
     padded_fp32_linears,
@@ -68,8 +69,18 @@ def trial_order(round_index, modes=MODES):
 
 @torch.inference_mode()
 def trial(
-    model, case, mode, arm, inputs, *, linear_work=None, prefix_prefill_slack=None, capture=None
+    model,
+    case,
+    mode,
+    arm,
+    inputs,
+    *,
+    linear_work=None,
+    prefix_prefill_slack=None,
+    capture=None,
+    dtype=None,
 ):
+    dtype = benchmark_dtype() if dtype is None else dtype
     donor, miss, targets, fillers = inputs
     gc.collect()
     with attention_mode(mode):
@@ -80,8 +91,8 @@ def trial(
         require(
             engine.execution_config.packed_prefill
             and cache.backend == "ascend_eager"
-            and cache.dtype == torch.bfloat16,
-            "expected packed BF16 ascend_eager",
+            and cache.dtype == cache.key_cache.dtype == cache.value_cache.dtype == dtype,
+            f"expected packed ascend_eager with {dtype} K/V storage",
         )
         params = SamplingParams(
             max_tokens=OUTPUTS,
@@ -145,6 +156,7 @@ def trial(
         )
         origins = {s.request.request_id: s.request.prefill_window_origin for s in schedule.requests}
         actual = {s.request.request_id: s.token_start for s in schedule.requests}
+        prefill_rows = {s.request.request_id: s.token_count for s in schedule.requests}
         require(
             origins == actual == starts, f"hit tokens {origins}, starts {actual}, expected {starts}"
         )
@@ -181,6 +193,7 @@ def trial(
                 ttft_ms=1000 * (first[rid] - submitted[rid]),
                 e2e_ms=1000 * (t - submitted[rid]),
                 hit_tokens=origins[rid],
+                prefill_rows=prefill_rows[rid],
             )
         work_stats = {}
         work_stats["prefix_groups"] = {
@@ -197,6 +210,8 @@ def trial(
             wall_ms=1000 * (end - min(submitted.values())),
             before_churn=before_churn,
             hit_tokens=origins,
+            key_cache_dtype=str(cache.key_cache.dtype),
+            value_cache_dtype=str(cache.value_cache.dtype),
             group_calls=counts,
             num_blocks=cache.num_blocks,
             **work_stats,
@@ -272,7 +287,7 @@ def run_cases(args, model, report, names, *, linear_work=None, modes=MODES):
                         for d in combo.token_diffs(first[key], result, "same_arm_first_run")
                     )
                 else:
-                    first[key] = result
+                    first.setdefault(key, result)
             for mode, arm in burst:
                 # Compare cache states within a mode, then compare modes within a cache state.
                 checks = []
@@ -293,7 +308,14 @@ def run_cases(args, model, report, names, *, linear_work=None, modes=MODES):
             failed.append(name)
             for label in sorted({issue.get("comparison", "control") for issue in issues}):
                 failed_comparisons.setdefault(label, []).append(name)
+        formal = [
+            d
+            for d in issues
+            if 1 <= d["round"] <= getattr(args, "correctness_rounds", args.repeats)
+        ]
         summary = dict(
+            correctness_status="FAIL" if formal else "PASS",
+            performance_valid=not issues,
             case=name,
             status="FAIL" if issues else "PASS",
             issues=len(issues),
@@ -352,6 +374,7 @@ def run_cases(args, model, report, names, *, linear_work=None, modes=MODES):
         failed_comparisons=failed_comparisons,
         warmups=args.warmups,
         repeats=args.repeats,
+        correctness_rounds=getattr(args, "correctness_rounds", args.repeats),
         modes=list(modes),
         **({"paired_ttft_saved_ms": benefit_by_case} if args.experiment == "benefit" else {}),
     )
@@ -366,6 +389,7 @@ def main(argv=None):
     group.add_argument(
         "--all-cases", action="store_true", help="Also time all 30 cases in benefit mode"
     )
+    p.add_argument("--correctness-rounds", type=int, help="Measured rounds with token comparisons")
     p.add_argument("--warmups", type=int)
     p.add_argument("--repeats", type=int)
     add_precision_arg(p)
@@ -383,6 +407,10 @@ def main(argv=None):
         args.repeats = 3 if correctness else 6
     if args.warmups is None:
         args.warmups = 0 if correctness else 1
+    if args.correctness_rounds is None:
+        args.correctness_rounds = args.repeats
+    if not 1 <= args.correctness_rounds <= args.repeats:
+        p.error("correctness rounds must fit within measured rounds")
     if args.repeats < 1 or args.warmups < 0 or not args.model.is_dir():
         p.error("provide a local model, positive repeats and nonnegative warmups")
     names = list(dict.fromkeys(args.case or (FULL if correctness or args.all_cases else BENEFIT)))
@@ -391,7 +419,7 @@ def main(argv=None):
 
     def run(args, device, report):
         model = OuroForCausalLM.from_pretrained(
-            args.model, device=device, dtype=torch.bfloat16
+            args.model, device=device, dtype=benchmark_dtype()
         ).eval()
         report.location = {"phase": "install_linears"}
         with padded_fp32_linears(model, args.linear_fp32_chunk) as work:

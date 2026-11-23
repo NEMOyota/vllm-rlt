@@ -154,7 +154,9 @@ def test_grouped_sdpa_matches_independent_dense_oracle(
     device = resolve_device(device_name)
     if device.type == "npu":
         torch.npu.set_device(device)
-    dtype = torch.bfloat16 if device.type == "npu" else torch.float32
+    from benchmarks.ascend_main_prefix_linear import benchmark_dtype
+
+    dtype = benchmark_dtype() if device.type == "npu" else torch.float32
     kernel = ascend.AscendAttention(prefix_prefill_slack=slack)
     calls = []
     attend = ascend._attend
@@ -170,7 +172,7 @@ def test_grouped_sdpa_matches_independent_dense_oracle(
         for _ in range(2):  # Descriptor reuse across layers.
             calls.clear()
             output = kernel.attend_metadata(q, kv[0, :, 1], kv[1, :, 1], batch)
-            tol = 0.02 if dtype is torch.bfloat16 else 2e-6
+            tol = {torch.bfloat16: 0.02, torch.float16: 0.002, torch.float32: 2e-6}[dtype]
             torch.testing.assert_close(output.float().cpu(), expected, atol=tol, rtol=tol)
             assert len(calls) == expected_calls
         torch.testing.assert_close(kv, original, rtol=0, atol=0, equal_nan=True)

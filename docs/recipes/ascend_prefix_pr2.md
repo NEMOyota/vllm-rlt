@@ -1,5 +1,7 @@
 # 昇腾 prefix cache 命中后的同批 prefill attention
 
+两轮正确性、三轮性能及多卡执行见[并行验收](ascend_prefix_parallel.md)。
+
 本分支在 Ouro 同步、单流、BF16、`ascend_eager` 的 packed prefill 路径中实现近似长度合批。prefix cache 命中消去部分 Q 行，attention 仍需读取当前请求的可见 KV。例如，两条请求各命中 48 个 token，分别剩 23、20 行。单独计算需要 2 次 SDPA，每个头共有 `23×71 + 20×68 = 2993` 个矩形分数位置。合批后使用 `[2, heads, 23, 71]` 的分数几何，每层每个循环深度只调用 1 次 SDPA，代价是多出 273 个位置（9.12%）。这里的矩形面积衡量补齐开销，设备实际执行受因果掩码和算子实现影响。
 
 ## 开启方式

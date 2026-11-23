@@ -54,10 +54,11 @@ def observed_worker(mode, audit_path, *args, linear_fp32_chunk=None, **kwargs):
     def close_observed(engine):
         cache = engine.cache_manager
         state.update(
-            **precision_settings(linear_fp32_chunk),
+            **precision_settings(linear_fp32_chunk, dtype=cache.key_cache.dtype),
             backend=cache.backend,
             packed=engine.execution_config.packed_prefill,
-            dtype=str(cache.dtype),
+            dtype=str(cache.key_cache.dtype),
+            value_cache_dtype=str(cache.value_cache.dtype),
             linear_weight_dtypes=sorted(
                 {
                     str(module.weight.dtype)

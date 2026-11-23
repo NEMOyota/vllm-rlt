@@ -38,7 +38,7 @@ def test_checkpoint_http_completions_stream_and_disconnect(tmp_path, backend, as
     folder.mkdir(parents=True, exist_ok=True)
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
-        port = listener.getsockname()[1]
+        port = int(os.environ.get("RLT_BENCH_PORT") or listener.getsockname()[1])
     command = [
         sys.executable,
         "-m",
@@ -50,7 +50,7 @@ def test_checkpoint_http_completions_stream_and_disconnect(tmp_path, backend, as
         "--device",
         "npu",
         "--dtype",
-        "bfloat16",
+        os.environ.get("RLT_BENCH_DTYPE", "bfloat16"),
         "--attention-backend",
         backend,
         "--num-blocks",
@@ -74,9 +74,13 @@ def test_checkpoint_http_completions_stream_and_disconnect(tmp_path, backend, as
         )
     if asynchronous:
         command.extend(["--async-scheduling", "--exit-mode", "ouro_delayed", "--single-stream"])
+    env = os.environ.copy()
+    if env.get("RLT_BENCH_LINEAR_FP32_CHUNK"):
+        command[2] = "benchmarks.ascend_main_prefix_service_worker"
+        env.update(RLT_BENCH_ATTENTION="main", RLT_BENCH_AUDIT=str(folder / "worker.json"))
     with (folder / "service.log").open("w") as log:
         process = subprocess.Popen(
-            command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
+            command, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
         )
 
         async def exercise():
@@ -164,4 +168,10 @@ def test_checkpoint_http_completions_stream_and_disconnect(tmp_path, backend, as
             except subprocess.TimeoutExpired:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait(timeout=10)
+        if env.get("RLT_BENCH_LINEAR_FP32_CHUNK"):
+            from benchmarks.ascend_main_prefix_linear import check_linear_usage
+
+            state = json.loads((folder / "worker.json").read_text())["state"]
+            assert state["precision"] == "linear_fp32_padded" and state["linear_fp32_chunk"] == 256
+            check_linear_usage(state["linear_work"])
         assert process.returncode == 0, (folder / "service.log").read_text()

@@ -2,6 +2,7 @@
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import platform
@@ -24,6 +25,7 @@ DIAGNOSTICS = "benchmarks.ascend_prefix_pr1_diagnostics"
 MATRIX = "benchmarks.ascend_main_prefix_matrix"
 SERVICE = "benchmarks.ascend_main_prefix_service"
 COMBO = "benchmarks.ascend_main_prefix_combo"
+REPLAY = "benchmarks.ascend_prefix_pr1_replay"
 PROBE = "benchmarks/ascend_prefix_pr1_hardware.py"
 CPU = ("pre-commit", "config")
 NPU = (
@@ -31,8 +33,10 @@ NPU = (
     "npu-regression",
     "npu-contract",
     "stock-http",
+    "bf16-replay",
     "bf16-combo",
     "bf16-matrix",
+    "fp32-replay",
     "fp32-combo",
     "fp32-matrix",
     "bf16-burst",
@@ -54,6 +58,8 @@ GROUPING = (
 )
 GROUP_TEST = "tests/test_ascend_prefix_prefill_groups.py"
 PR2 = "benchmarks.ascend_prefix_pr2"
+B4_REPRO = ("b4-cases-bf16", "b4-cases-fp32", "b4-cases-fp16")
+FP16_PATCH = "benchmarks/ascend_prefix_fp16_replay.patch"
 HARNESS = (
     "benchmarks/ascend_main_prefix_combo.py",
     "benchmarks/ascend_main_prefix_linear.py",
@@ -64,6 +70,7 @@ HARNESS = (
     "benchmarks/ascend_main_prefix_service.py",
     "benchmarks/ascend_main_prefix_service_worker.py",
     "benchmarks/ascend_prefix_pr1_diagnostics.py",
+    "benchmarks/ascend_prefix_pr1_replay.py",
     "benchmarks/ascend_prefix_opportunities.py",
     "benchmarks/ascend_prefix_pr2.py",
     GROUP_TEST,
@@ -137,6 +144,7 @@ def stage_commands(args, out):
     benchmark("environment", DIAGNOSTICS, ["env"])
     for precision in ("bf16", "fp32"):
         chunk = ["--linear-fp32-chunk", "256"] if precision == "fp32" else []
+        benchmark(precision + "-replay", REPLAY, chunk)
         benchmark(precision + "-combo", COMBO, ["--repeats", "2", *chunk])
         benchmark(
             precision + "-matrix", MATRIX, [precision, "--main-only", "--repeats", "3", *chunk]
@@ -184,6 +192,9 @@ def stage_commands(args, out):
     benchmark("pr2-reference", PR2, ["--repeats", "3", "--linear-fp32-chunk", "256"])
     benchmark("pr2-profile", PR2, ["--profile", "--case", "near"])
     benchmark("drift", DIAGNOSTICS, ["drift", "--matrix", str(out / "bf16-matrix" / "review.json")])
+    benchmark("b4-cases-bf16", DIAGNOSTICS, ["drift"])
+    benchmark("b4-cases-fp32", DIAGNOSTICS, ["drift", "--linear-fp32-chunk", "256"])
+    benchmark("b4-cases-fp16", DIAGNOSTICS, ["drift", "--dtype", "float16"])
     benchmark("profile", DIAGNOSTICS, ["profile"])
     return {stage.name: stage for stage in stages}
 
@@ -254,6 +265,27 @@ def install_checks(checkout, tools_sha):
         target = "tests/test_pr1_stock_http_replay.py" if source == STOCK else source
         data = subprocess.check_output(["git", "show", f"{tools_sha}:{source}"], cwd=ROOT)
         (checkout / target).write_bytes(data)
+
+
+def run_fp16_stage(stage, checkout, env, out, tools_sha):
+    # The ordinary candidate enforces BF16. Give the experimental FP16 worker
+    # a sibling worktree inside the suite's temporary clone.
+    tree = checkout.parent / "fp16-candidate"
+    git(checkout, "worktree", "add", "--quiet", "--detach", str(tree), "HEAD")
+    install_checks(tree, tools_sha)
+    patch = out / "fp16-runtime.patch"
+    data = subprocess.check_output(["git", "show", f"{tools_sha}:{FP16_PATCH}"], cwd=ROOT)
+    patch.write_bytes(data)
+    provenance = dict(
+        runtime_patch=patch.name, runtime_patch_sha256=hashlib.sha256(data).hexdigest()
+    )
+    applied = subprocess.run(["git", "apply", str(patch)], cwd=tree, capture_output=True, text=True)
+    if applied.returncode:
+        detail = f"could not apply the FP16 replay patch: {applied.stderr.strip()}"
+        print(f"[{stage.name}] INCOMPLETE  {detail}", flush=True)
+        return dict(status="INCOMPLETE", detail=detail, **provenance)
+    worker_env = dict(env, PYTHONPATH=os.pathsep.join((str(tree), env["PYTHONPATH"])))
+    return {**run_stage(stage, tree, worker_env, out), **provenance}
 
 
 def check_hardware(checkout, env, out, tools_sha, model, expected):
@@ -351,7 +383,33 @@ def markdown_report(out, report):
         sources = [f"[日志]({row['log']})"] if row.get("log") else []
         if row.get("artifact") and (out / row["artifact"]).is_file():
             sources.append(f"[数据]({row['artifact']})")
+        if row.get("runtime_patch"):
+            sources.append(f"[FP16 实验补丁]({row['runtime_patch']})")
         lines.append(f"| {name} | {row['status']} | {' · '.join(sources)} |")
+
+    drift_rows = []
+    for name in B4_REPRO:
+        evidence = report["stages"].get(name, {}).get("evidence", {})
+        for case, row in evidence.get("results", {}).items():
+            counts = [
+                f"{row[pair]} / {row['requests']}" if pair in row else "—"
+                for pair in ("off_vs_miss", "off_vs_reuse")
+            ]
+            drift_rows.append(
+                f"| {evidence['precision']} | [{case}]({name}/{case}.json) | "
+                f"{counts[0]} | {counts[1]} | {row['status']} |"
+            )
+    if drift_rows:
+        lines += [
+            "",
+            "## 910B4 历史分歧场景的同精度对照",
+            "",
+            "每格为输出 token 有分歧的请求数 / 目标请求总数。位置从 1 起计。",
+            "",
+            "| 精度 | 场景与逐请求记录 | off 对 miss | off 对 reuse | 状态 |",
+            "|---|---|---:|---:|---|",
+            *drift_rows,
+        ]
 
     for name in ("bf16-matrix", "fp32-matrix"):
         evidence = report["stages"].get(name, {}).get("evidence", {})
@@ -364,6 +422,52 @@ def markdown_report(out, report):
                     f"{len(failed)} 个失败。{'、'.join(failed)}",
                 ]
             )
+    for name in ("bf16-replay", "fp32-replay"):
+        evidence = report["stages"].get(name, {}).get("evidence", {})
+        cases = evidence.get("cases", {})
+        if not cases:
+            continue
+        lines.extend(
+            [
+                "",
+                f"## {name}",
+                "",
+                "| 场景 | 缓存 | 请求 | 预期 / 实际命中 token | 实际 prefill 区间 | "
+                "结束时活跃页 | 控制检查 |",
+                "|---|---|---|---|---|---:|---|",
+            ]
+        )
+        for case, result in cases.items():
+            for mode, rows in result["runs"].items():
+                for request in ("cold", "repeat", "branch"):
+                    row = rows.get(request, {})
+                    spans = " ".join(f"[{a},{b})" for a, b in row.get("prefill_spans", []))
+                    controls = ", ".join(row.get("controls_failed", [])) or (
+                        "PASS" if row else "未执行"
+                    )
+                    lines.append(
+                        f"| {case} | {mode} | {request} | {row.get('expected_hit_tokens', '—')} / "
+                        f"{row.get('hit_tokens', '—')} | {spans or '—'} | "
+                        f"{row.get('live_blocks_after', '—')} | {controls} |"
+                    )
+        lines.append("")
+        comparisons = {case: result["token_comparisons"] for case, result in cases.items()}
+        if evidence.get("budget_comparisons"):
+            comparisons["整段与分步（预算诊断）"] = evidence["budget_comparisons"]
+        for case, checks in comparisons.items():
+            matches = sum(check["status"] == "PASS" for check in checks)
+            missing = sum(check["status"] == "NOT_RUN" for check in checks)
+            lines.append(
+                f"- {case} 共 {len(checks)} 项逐 token 对照，{matches} 项一致，{missing} 项未执行。"
+            )
+            for diff in checks:
+                if diff["status"] == "FAIL":
+                    lines.append(
+                        f"  - {diff['reference']} 与 {diff['actual']} 在第 "
+                        f"{diff['first_diff_1based']} 个输出 token 首次不同，"
+                        f"ID 为 {diff['expected_id']} / {diff['actual_id']}。"
+                    )
+        lines.extend(["", f"[逐 token、退出深度和分步 attention 审计]({name}/review.json)"])
     fields = (
         "round",
         "mode",
@@ -431,7 +535,7 @@ def main(argv=None):
     p.add_argument(
         "--only",
         action="append",
-        choices=(*CPU, *NPU, *GROUPING, *LEGACY_GROUPING),
+        choices=(*CPU, *NPU, *GROUPING, *LEGACY_GROUPING, *B4_REPRO),
         help="Run a named stage; repeat to select multiple stages",
     )
     p.add_argument(
@@ -480,6 +584,7 @@ def main(argv=None):
         *NPU[2:],
         *GROUPING,
         *LEGACY_GROUPING,
+        *B4_REPRO,
     ]
     names = [name for name in order if name in selected]
     if args.model:
@@ -570,7 +675,10 @@ def main(argv=None):
                     if not installed and name not in ("pre-commit", "npu-regression"):
                         install_checks(checkout, tools_sha)
                         installed = True
-                    result = run_stage(stages[name], checkout, env, out)
+                    if name == "b4-cases-fp16":
+                        result = run_fp16_stage(stages[name], checkout, env, out, tools_sha)
+                    else:
+                        result = run_stage(stages[name], checkout, env, out)
                     report["stages"][name] = result
                 snapshot(out, report)
     except (OSError, subprocess.CalledProcessError) as exc:
