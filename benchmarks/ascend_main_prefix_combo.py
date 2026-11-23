@@ -416,10 +416,10 @@ def main(argv=None):
                 print(tag, json.dumps(data, ensure_ascii=False), flush=True)
 
         location = dict(phase="setup")
+        dtype = benchmark_dtype()
         try:
             device = resolve_device("npu:0")
             torch.npu.set_device(device)
-            dtype = benchmark_dtype()
             matmul = getattr(torch.npu, "matmul", None)
             record(
                 "COMBO_ENV",

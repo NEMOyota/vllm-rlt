@@ -77,8 +77,9 @@ def cpu_packed_model(monkeypatch, request):
     )
 
 
-def test_three_arms_through_cpu_runner(cpu_packed_model):
-    model = cpu_packed_model
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_three_arms_through_cpu_runner(cpu_packed_model, dtype):
+    model = cpu_packed_model.to(dtype)
     case = combo.Case(16, 2, 4, 2)
     donor, miss, targets = combo.prompts(case, model.config.vocab_size)
     for arm in combo.ARMS:

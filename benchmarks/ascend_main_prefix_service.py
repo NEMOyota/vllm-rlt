@@ -278,7 +278,7 @@ def reconcile(mode, primers, plan, rows, audit, *, linear_fp32_chunk=None):
     require(
         state.get("backend") == "ascend_eager"
         and state["packed"]
-        and state["dtype"] == str(benchmark_dtype())
+        and state["dtype"] == state["value_cache_dtype"] == str(benchmark_dtype())
         and state["linear_weight_dtypes"] == [str(benchmark_dtype())]
         and not state["async_scheduling"]
         and not state["multi_stream"]
