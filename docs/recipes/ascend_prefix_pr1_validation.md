@@ -65,6 +65,14 @@ ASCEND_RT_VISIBLE_DEVICES=0 bash docs/recipes/ascend_910b3_b4_repro.sh
 
 在 `PR_RESULTS.md` 看各场景两项比较中有分歧的请求数。在 `b4-cases-bf16/<场景>.json` 和 `b4-cases-fp32/<场景>.json` 看原始输入、各目标实际命中量、首步 prefill 行数、完整输出和首个不相同 token 的位置及 ID。FP32 文件还记录每个缓存状态实际执行的线性层数。运行环境、权重指纹和实测设备型号随结果保存。
 
+已有上述两组结果时，选择同一张 B3 和同一份权重，单独补跑 FP16。下面这条命令采集环境和四个场景，每个场景按 `off / miss / reuse` 各跑一次。脚本会打印新的结果目录。
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0 bash docs/recipes/ascend_910b3_b4_repro.sh --fp16-only
+```
+
+FP16 worker 在临时工作树中应用随测试提交固定的 dtype 放行补丁，把同一 checkpoint 加载为 FP16，按实际行数执行线性层。报告保存 `fp16-runtime.patch` 和 SHA-256。在 `b4-cases-fp16/<场景>.json` 中，`arms.off.observed_dtypes`、`arms.miss.observed_dtypes` 和 `arms.reuse.observed_dtypes` 记录权重、K/V 缓存、SDPA 的 Q/K/V 与输出的实测 dtype，以及 SDPA 调用次数。每条目标请求的 16 个输出 token 都与本次 FP16 的 `off` 比较。首个分歧和两边的 token ID 在 `differences` 中。目标步出现 NaN 或 Inf 时，报告将该场景记为 FAIL 并写明请求和步号。
+
 ### 先跑冷请求、完整重复与分支后缀
 
 下面两行分别在对应服务器执行，沿用上面设置的 `MODEL`，把 0 换成已分配的单卡编号。这组检查也已纳入 `all` 和 `npu`。要同时跑固定行 FP32 线性层参照，在同一命令再加 `--only fp32-replay`。
@@ -195,6 +203,6 @@ python -m benchmarks.ascend_prefix_pr1_suite pr2 --chip "$CHIP"
 
 ### 精度与结论
 
-原生 BF16 是上游主推理精度。这里的 `fp32` 和 `pr2-reference` 使用 FP32 线性层固定 256 行，KV 与 SDPA 为 BF16。黄区 FP16 使用本地补丁，可作为补充实验。报告中提供补丁版本、worker 的实际权重/KV dtype、线性层设置和相同精度的对照。当前两个候选分支的 NPU 产品入口要求 BF16 权重。已运行的 BF16 分歧记 FAIL 并附可复现输入。未跑或设备条件不足记 NOT_RUN/INCOMPLETE。原生 BF16 和精度参照分别报告。[上游精度政策](https://github.com/InferMatrixLab/vllm-rlt/blob/ce200f0d2085fb041c66691245e29aef2a9ed714/docs/precision-policy.md)
+原生 BF16 是上游主推理精度。这里的 `fp32` 和 `pr2-reference` 使用 FP32 线性层固定 256 行，KV 与 SDPA 为 BF16。历史黄区 FP16 服务使用本地补丁，本分支的四场景 FP16 回放使用随结果归档的实验补丁。报告中提供补丁版本、worker 的实际权重/KV dtype、线性层设置和相同精度的对照。当前两个候选分支的 NPU 产品入口要求 BF16 权重。已运行的 BF16 分歧记 FAIL 并附可复现输入。未跑或设备条件不足记 NOT_RUN/INCOMPLETE。原生 BF16 和精度参照分别报告。[上游精度政策](https://github.com/InferMatrixLab/vllm-rlt/blob/ce200f0d2085fb041c66691245e29aef2a9ed714/docs/precision-policy.md)
 
 PR 1 归因于同卡缓存关闭到开启的差值。PR 2 三种模式都开启缓存，main 到 exact 测等长合批，exact 到 similar 测近似合批的增量。两份 PR 的服务实验都是实 HTTP 服务回放可复现的合成混合负载。任何服务性能结论须同时给出该负载的正确性和真实触发情况。

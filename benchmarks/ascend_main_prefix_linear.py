@@ -10,10 +10,13 @@ from torch import nn
 from torch.nn import functional as F
 
 
-def precision_settings(rows):
-    return dict(
-        precision="native_bf16" if rows is None else "linear_fp32_padded", linear_fp32_chunk=rows
-    )
+def precision_settings(rows, *, dtype=torch.bfloat16):
+    if dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(f"unsupported replay dtype {dtype}")
+    if rows is not None and dtype != torch.bfloat16:
+        raise ValueError("the fixed-row FP32 reference requires BF16 weights and KV")
+    native = "native_fp16" if dtype == torch.float16 else "native_bf16"
+    return dict(precision=native if rows is None else "linear_fp32_padded", linear_fp32_chunk=rows)
 
 
 def add_precision_arg(parser):

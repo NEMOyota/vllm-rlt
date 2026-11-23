@@ -2,6 +2,7 @@
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import platform
@@ -45,7 +46,8 @@ NPU = (
     "profile",
 )
 GROUPING = ("grouped-matrix", "grouped-burst", "grouped-paced", "observe-burst", "observe-paced")
-B4_REPRO = ("b4-cases-bf16", "b4-cases-fp32")
+B4_REPRO = ("b4-cases-bf16", "b4-cases-fp32", "b4-cases-fp16")
+FP16_PATCH = "benchmarks/ascend_prefix_fp16_replay.patch"
 HARNESS = (
     "benchmarks/ascend_main_prefix_combo.py",
     "benchmarks/ascend_main_prefix_linear.py",
@@ -170,6 +172,7 @@ def stage_commands(args, out):
     benchmark("drift", DIAGNOSTICS, ["drift", "--matrix", str(out / "bf16-matrix" / "review.json")])
     benchmark("b4-cases-bf16", DIAGNOSTICS, ["drift"])
     benchmark("b4-cases-fp32", DIAGNOSTICS, ["drift", "--linear-fp32-chunk", "256"])
+    benchmark("b4-cases-fp16", DIAGNOSTICS, ["drift", "--dtype", "float16"])
     benchmark("profile", DIAGNOSTICS, ["profile"])
     return {stage.name: stage for stage in stages}
 
@@ -240,6 +243,27 @@ def install_checks(checkout, tools_sha):
         target = "tests/test_pr1_stock_http_replay.py" if source == STOCK else source
         data = subprocess.check_output(["git", "show", f"{tools_sha}:{source}"], cwd=ROOT)
         (checkout / target).write_bytes(data)
+
+
+def run_fp16_stage(stage, checkout, env, out, tools_sha):
+    # The ordinary candidate enforces BF16. Give the experimental FP16 worker
+    # a sibling worktree inside the suite's temporary clone.
+    tree = checkout.parent / "fp16-candidate"
+    git(checkout, "worktree", "add", "--quiet", "--detach", str(tree), "HEAD")
+    install_checks(tree, tools_sha)
+    patch = out / "fp16-runtime.patch"
+    data = subprocess.check_output(["git", "show", f"{tools_sha}:{FP16_PATCH}"], cwd=ROOT)
+    patch.write_bytes(data)
+    provenance = dict(
+        runtime_patch=patch.name, runtime_patch_sha256=hashlib.sha256(data).hexdigest()
+    )
+    applied = subprocess.run(["git", "apply", str(patch)], cwd=tree, capture_output=True, text=True)
+    if applied.returncode:
+        detail = f"could not apply the FP16 replay patch: {applied.stderr.strip()}"
+        print(f"[{stage.name}] INCOMPLETE  {detail}", flush=True)
+        return dict(status="INCOMPLETE", detail=detail, **provenance)
+    worker_env = dict(env, PYTHONPATH=os.pathsep.join((str(tree), env["PYTHONPATH"])))
+    return {**run_stage(stage, tree, worker_env, out), **provenance}
 
 
 def check_hardware(checkout, env, out, tools_sha, model, expected):
@@ -334,6 +358,8 @@ def markdown_report(out, report):
         sources = [f"[日志]({row['log']})"] if row.get("log") else []
         if row.get("artifact") and (out / row["artifact"]).is_file():
             sources.append(f"[数据]({row['artifact']})")
+        if row.get("runtime_patch"):
+            sources.append(f"[FP16 实验补丁]({row['runtime_patch']})")
         lines.append(f"| {name} | {row['status']} | {' · '.join(sources)} |")
 
     drift_rows = []
@@ -602,7 +628,10 @@ def main(argv=None):
                     if not installed and name not in ("pre-commit", "npu-regression"):
                         install_checks(checkout, tools_sha)
                         installed = True
-                    result = run_stage(stages[name], checkout, env, out)
+                    if name == "b4-cases-fp16":
+                        result = run_fp16_stage(stages[name], checkout, env, out, tools_sha)
+                    else:
+                        result = run_stage(stages[name], checkout, env, out)
                     report["stages"][name] = result
                 snapshot(out, report)
     except (OSError, subprocess.CalledProcessError) as exc:

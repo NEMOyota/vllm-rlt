@@ -67,7 +67,7 @@ def trial_order(round_index, modes=MODES):
 
 
 @torch.inference_mode()
-def trial(model, case, mode, arm, inputs, *, linear_work=None):
+def trial(model, case, mode, arm, inputs, *, linear_work=None, dtype=torch.bfloat16):
     donor, miss, targets, fillers = inputs
     gc.collect()
     with attention_mode(mode):
@@ -78,8 +78,8 @@ def trial(model, case, mode, arm, inputs, *, linear_work=None):
         require(
             engine.execution_config.packed_prefill
             and cache.backend == "ascend_eager"
-            and cache.dtype == torch.bfloat16,
-            "expected packed BF16 ascend_eager",
+            and cache.dtype == cache.key_cache.dtype == cache.value_cache.dtype == dtype,
+            f"expected packed ascend_eager with {dtype} K/V storage",
         )
         params = SamplingParams(
             max_tokens=OUTPUTS,
@@ -181,6 +181,8 @@ def trial(model, case, mode, arm, inputs, *, linear_work=None):
             wall_ms=1000 * (end - min(submitted.values())),
             before_churn=before_churn,
             hit_tokens=origins,
+            key_cache_dtype=str(cache.key_cache.dtype),
+            value_cache_dtype=str(cache.value_cache.dtype),
             group_calls=counts,
             num_blocks=cache.num_blocks,
             **work_stats,

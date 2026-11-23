@@ -46,13 +46,19 @@ def test_b4_replay_preserves_inputs_hits_and_first_different_token(
 
     monkeypatch.setattr(diagnostics, "trace_logits", inject)
     prompts = {}
-    for chunk in (None, 256):
-        out = tmp_path / str(chunk)
+    for precision, dtype, chunk in (
+        ("native_bf16", torch.bfloat16, None),
+        ("linear_fp32_padded", torch.bfloat16, 256),
+        ("native_fp16", torch.float16, None),
+    ):
+        cpu_packed_model.to(dtype)
+        out = tmp_path / precision
         out.mkdir()
         code = diagnostics.run_drift(cpu_packed_model, diagnostics.KNOWN, out, chunk)
         assert code == (1 if chunk is None else 0)
         review = json.loads((out / "review.json").read_text())
         assert review["differences"] == (1 if chunk is None else 0)
+        assert review["precision"] == precision
         for name, hits in expected_hits.items():
             row = json.loads((out / f"{name}.json").read_text())
             inputs = (row["primer_ids"], row["target_prompt_ids"])
@@ -61,6 +67,9 @@ def test_b4_replay_preserves_inputs_hits_and_first_different_token(
             assert len(row["target_prompt_ids"]) == row["requests"] == len(hits)
             assert set(row["arms"]) == {"off", "miss", "reuse"}
             for arm, trial in row["arms"].items():
+                observed = trial["observed_dtypes"]
+                assert observed["sdpa_calls"] > 0
+                assert {v for k, v in observed.items() if k != "sdpa_calls"} == {str(dtype)}
                 assert ("linear_work" in trial) == (chunk == 256)
                 if chunk == 256:
                     assert trial["linear_work"]["executed"] > 0
@@ -73,12 +82,13 @@ def test_b4_replay_preserves_inputs_hits_and_first_different_token(
                         observed["prefill_rows"]
                         == len(row["target_prompt_ids"][rid]) - observed["hit_tokens"]
                     )
-    row = json.loads((tmp_path / "None" / "c4_h3.json").read_text())
-    assert (row["off_vs_miss"], row["off_vs_reuse"]) == (0, 1)
-    (diff,) = row["differences"]
-    assert diff["request"] == "target-0" and diff["comparison"] == "off_vs_reuse"
-    assert diff["first_diff_1based"] == 3 and diff["prior_generated_ids"] == [0, 0]
-    assert (diff["expected"], diff["actual"], diff["cached_tokens"]) == (0, 1, 128)
+        if chunk is None:
+            row = json.loads((out / "c4_h3.json").read_text())
+            assert (row["off_vs_miss"], row["off_vs_reuse"]) == (0, 1)
+            (diff,) = row["differences"]
+            assert diff["request"] == "target-0" and diff["comparison"] == "off_vs_reuse"
+            assert diff["first_diff_1based"] == 3 and diff["prior_generated_ids"] == [0, 0]
+            assert (diff["expected"], diff["actual"], diff["cached_tokens"]) == (0, 1, 128)
 
 
 def test_missing_cache_evidence_stays_incomplete(tmp_path, monkeypatch):
@@ -88,9 +98,19 @@ def test_missing_cache_evidence_stays_incomplete(tmp_path, monkeypatch):
         return {"target_prompt_ids": {"target-0": [1]}, "differences": []}
 
     monkeypatch.setattr(diagnostics, "diagnose_case", run)
-    assert diagnostics.run_drift(None, ["c4_h3", "p1024_s8"], tmp_path, None) == 2
+    model = torch.nn.Linear(1, 1, dtype=torch.bfloat16)
+    assert diagnostics.run_drift(model, ["c4_h3", "p1024_s8"], tmp_path, None) == 2
     review = json.loads((tmp_path / "review.json").read_text())
     assert review["status"] == "INCOMPLETE" and review["results"]["p1024_s8"]["status"] == "PASS"
     row = json.loads((tmp_path / "c4_h3.json").read_text())
     assert row["status"] == "INCOMPLETE" and "unexpected hit count" in row["detail"]
     assert "off_vs_reuse" not in row
+
+
+def test_native_fp16_rejects_nonfinite_outputs(tmp_path, cpu_packed_model):  # noqa: F811
+    model = cpu_packed_model.to(torch.float16)
+    with model.lm_head.register_forward_hook(lambda _, _args, scores: scores.fill_(torch.inf)):
+        assert diagnostics.run_drift(model, ["edge_p16"], tmp_path, None) == 1
+    review = json.loads((tmp_path / "review.json").read_text())
+    assert review["status"] == "FAIL"
+    assert "off target-0 token 1: non-finite" in review["results"]["edge_p16"]["detail"]
