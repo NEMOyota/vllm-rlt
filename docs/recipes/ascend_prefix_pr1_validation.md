@@ -131,10 +131,50 @@ vLLM 的核心用例验证块复用和逐出。vLLM-Ascend 的双卡用例对共
 - **性能。** 用相同 dtype、设备、模型、负载和执行配置比较，列绝对值、逐轮变化及错误数。分开报告冷请求开销和热请求收益。输出或路径检查有差异的场景标为诊断数据。用 profiler 的输入形状、设备执行和 prefill 行数解释无 profiler 的计时结果。
 - **提交。** 给出复现命令、受支持的配置、已知限制、未跑检查，链接可供审阅的结果及 profile。按照上游 PR 模板，由贡献者本人填写目标、关键变量、改动如何影响它、目标用户与需求，以及为什么需要提交 PR。[贡献说明](https://github.com/InferMatrixLab/vllm-rlt/blob/ce200f0/CONTRIBUTING.md) · [精度政策](https://github.com/InferMatrixLab/vllm-rlt/blob/ce200f0/docs/precision-policy.md) · [开发指南](https://github.com/InferMatrixLab/vllm-rlt/blob/ce200f0/docs/developer-guide.md) · [PR 模板](https://github.com/InferMatrixLab/vllm-rlt/blob/ce200f0/.github/PULL_REQUEST_TEMPLATE.md)
 
-## PR 2 的独立实验
+## PR 1 与 PR 2 的提交数据和实验脚本
+
+两份 PR 分别记录最终候选 SHA。上游 PR 模板要求贡献者填写验证计划和结果，并在仓库根目录执行 `pre-commit run --all-files`。下面是针对这次两款芯片支持范围的验证安排。每个候选跑一次 CPU 检查。声明覆盖 910B3、910B4 时，两款卡分别跑单卡真权重测试。报告正文给出绝对值、样本数和异常，附可下载的原始证据。[上游 PR 模板](https://github.com/InferMatrixLab/vllm-rlt/blob/ce200f0d2085fb041c66691245e29aef2a9ed714/.github/PULL_REQUEST_TEMPLATE.md)
+
+两个工作树的总入口都叫 `benchmarks/ascend_prefix_pr1_suite.py`。PR 1 使用 `test/ascend-prefix-pr1-validation` 的 `all`。PR 2 使用 `exp/ascend-prefix-pr2-grouping` 的 `pr2`。PR 1 工作树里同名的 `pr2` 子命令只运行早期的 benchmark 合批原型。下面列出实验脚本的文件名，Python benchmark 均在 `benchmarks/`，pytest 文件均在 `tests/`。[PR 2 固定版本运行说明](https://github.com/NEMOyota/vllm-rlt/blob/9a2d5100c5344cd6d1cb0f210ea19ebcb6ccbb67/docs/recipes/ascend_prefix_pr2.md)
+
+| 提交和问题 | 要跑的阶段 | 对应实验脚本 | 提交时展示的数据 |
+|---|---|---|---|
+| 两份 PR 的环境与回归 | 各候选的 `pre-commit`、`config`，各型号的 `environment` | `ascend_prefix_pr1_suite.py`、`ascend_prefix_pr1_hardware.py`、`ascend_prefix_pr1_diagnostics.py` | 候选与测试 SHA、单卡型号、CANN/Torch/torch-npu、HF32、模型指纹、pytest 通过/失败/跳过数量。 |
+| PR 1 的设备功能和正式服务入口 | `npu-regression`、`npu-contract`、`stock-http` | `test_ascend_prefix_cache_contract.py`、`test_ascend_serving.py`，及候选自带 NPU 用例 | JUnit 和服务冒烟结果，包含共享页、取消与复用、SSE、断连恢复。 |
+| PR 1 的缓存机制与数值一致性 | `{bf16,fp32}-replay`、`{bf16,fp32}-combo`、`{bf16,fp32}-matrix`、`drift` | `ascend_prefix_pr1_replay.py`、`ascend_main_prefix_combo.py`、`ascend_main_prefix_matrix.py`、`ascend_prefix_pr1_diagnostics.py` | 冷/重复/分支回放、实际命中和逐步区间、每请求 16 个输出、分页与掩码检查、30 例通过数。单列首处分歧、双方 ID、可取得的 top-2 依据和失败场景。 |
+| PR 1 的缓存收益 | `bf16-benefit`、`bf16-burst`、`bf16-paced`、`profile` | `ascend_main_prefix_matrix.py benefit`、`ascend_main_prefix_service.py`、`ascend_prefix_pr1_diagnostics.py profile` | 引擎内 off/miss/reuse 的冷开销和命中收益。附服务 off/main 每轮的完成数、HTTP 错误、输出分歧、TTFT P50/P95、输出 tok/s 以及代表性 prefill trace。 |
+| PR 2 的入口回归与 attention 正确性 | 在 PR 2 候选上复跑 `npu-regression`、`npu-contract`、`stock-http`，再跑 `pr2-oracle` | 同上入口测试、`test_ascend_prefix_prefill_groups.py`、`test_ascend_prefix_pr2_benchmark.py`（CPU） | 原有默认路径回归、设备 oracle 对独立稠密 attention 的比较、页表、有效行、因果掩码与填充隔离。 |
+| PR 2 的合批贡献 | `pr2-geometry`、`pr2-reference`、`pr2-profile` | `ascend_prefix_pr2.py` | 六组受控形状的 main/exact/similar 逐 token 对照，真实合批数、节省的 SDPA 次数、额外填充、各轮 TTFT 和设备 trace。单请求、整齐冷批和离群请求也要报告。 |
+| PR 2 的服务效果 | `pr2-burst`、`pr2-paced`、`observe-burst`、`observe-paced` | `ascend_main_prefix_service.py`、`ascend_main_prefix_service_worker.py`、`ascend_prefix_opportunities.py` | 同一混合 HTTP 流量下三种模式各三轮，逐轮 P50/P95、吞吐、实际近似组数及 `similar_service`。另附 `opportunities.json` 的同批机会与分母。零触发也列入结果，受控形状的加速单独报告。 |
+
+### 运行两份候选
+
+以下命令假定已设置 `MODEL` 和 `ASCEND_RT_VISIBLE_DEVICES`。在 B3 的 shell 中设置 `export CHIP=910B3`，B4 使用 `export CHIP=910B4`。PR 1 的全量命令从其测试工作树运行。
 
 ```bash
-python -m benchmarks.ascend_prefix_pr1_suite pr2
+python -m benchmarks.ascend_prefix_pr1_suite all --chip "$CHIP"
 ```
 
-该入口复用 BF16 30 例矩阵以及 burst/paced，并保留 `main → grouped` 的单独比较。它还各做一轮单独的调度观测。查看 `observe-{burst,paced}/round-1-main/opportunities.json` 和同目录 `worker.json` 的 `prefill_steps`。记录包括同一步的成员、请求摘要、循环深度、起点、剩余长度、Q 行数和可见 KV 长度。分母为目标请求参与 prefill 的“请求 × 步”次数，剔除 primer。已被主线整齐冷批覆盖的成员另计。阈值 0/2/4/8 给出同起点、同批、存在一个长度相容伙伴的成员数。阈值是包含关系。这些数值衡量机会，不等于能同时成组的数量或实测速率。观测轮的计时只供诊断。近似长度计算仍属于后续设计。
+在已有 fork 中取得 PR 2 工作树。若已经有该工作树，可直接从其根目录执行后面的 Python 命令。
+
+```bash
+git fetch https://github.com/NEMOyota/vllm-rlt.git refs/heads/exp/ascend-prefix-pr2-grouping
+git worktree add --detach ../rlt-pr2-submit-tests FETCH_HEAD
+cd ../rlt-pr2-submit-tests
+
+# 每个 PR 2 候选一次。CPU 范围包含 pre-commit 和配置检查。
+python -m benchmarks.ascend_prefix_pr1_suite cpu
+
+# 每款卡运行这两条命令。第一条验证默认路径，第二条测合批。
+python -m benchmarks.ascend_prefix_pr1_suite --chip "$CHIP" \
+  --only npu-regression --only npu-contract --only stock-http
+python -m benchmarks.ascend_prefix_pr1_suite pr2 --chip "$CHIP"
+```
+
+用同卡 PR 1 的 burst/paced 清单复测 PR 2 时，在最后一条命令追加 `--reference-traffic "$PR1_RESULTS"`。若提交候选在另一工作树，每个套件命令都可以用 `--repo` 和 `--candidate` 指向该 PR 的最终提交。两份 PR 都保留 `PR_RESULTS.md`、`review.json`、`hardware.json`、环境与模型指纹、相关 JUnit、CSV/JSONL 及代表性 trace 的可访问链接。大型 trace 单独打包。
+
+### 精度与结论
+
+原生 BF16 是上游主推理精度。这里的 `fp32` 和 `pr2-reference` 使用 FP32 线性层固定 256 行，KV 与 SDPA 为 BF16。黄区 FP16 使用本地补丁，可作为补充实验。报告中提供补丁版本、worker 的实际权重/KV dtype、线性层设置和相同精度的对照。当前两个候选分支的 NPU 产品入口要求 BF16 权重。已运行的 BF16 分歧记 FAIL 并附可复现输入。未跑或设备条件不足记 NOT_RUN/INCOMPLETE。原生 BF16 和精度参照分别报告。[上游精度政策](https://github.com/InferMatrixLab/vllm-rlt/blob/ce200f0d2085fb041c66691245e29aef2a9ed714/docs/precision-policy.md)
+
+PR 1 归因于同卡缓存关闭到开启的差值。PR 2 三种模式都开启缓存，main 到 exact 测等长合批，exact 到 similar 测近似合批的增量。两份 PR 的服务实验都是实 HTTP 服务回放可复现的合成混合负载。任何服务性能结论须同时给出该负载的正确性和真实触发情况。
