@@ -88,6 +88,36 @@ curl --fail http://127.0.0.1:8123/v1/completions \
   -d '{"model":"ouro","prompt":"The capital of France is","max_tokens":8,"temperature":0,"min_loops":4,"max_loops":4,"exit_threshold":1}'
 ```
 
+## Reuse shared prompt prefixes on a single NPU
+
+For repeated system prompts or documents, opt in with
+`--enable-prefix-caching`. Ouro can reuse complete KV pages from a previous
+request, including a request that has already finished. A continuation
+computes the remaining prompt tokens. Each of the four loops uses its own KV
+pages. Prefix caching is off by default.
+
+Use synchronous, single-stream `ascend_eager` execution with BF16 weights,
+the `ouro` exit mode, ordinary prefill and fully reserved `last_exited` KV.
+The following example allows two concurrent requests. Keep each prompt within
+128 tokens for this example and send the fixed-depth greedy sampling parameters
+shown above.
+
+```bash
+python -m vllm_rlt.entrypoints.serve \
+  --model "$MODEL" --tokenizer "$MODEL" --served-model-name ouro \
+  --device npu --dtype bfloat16 --attention-backend ascend_eager \
+  --mode refill --exit-mode ouro --single-stream --no-uva \
+  --enable-prefix-caching --block-size 16 --num-blocks 128 \
+  --max-num-seqs 2 --max-num-batched-tokens 256 --prefill-chunk-size 128 \
+  --host 127.0.0.1 --port 8123
+```
+
+**BF16 output can change on a cache hit.** Tests on Ascend 910B3 and 910B4
+found prompts for which enabling reuse changed a greedy output token, even
+though page and mask checks passed. Keep caching disabled when the application
+requires token-for-token agreement with uncached inference. Latency depends on
+the suffix length and on the other requests in the same batch.
+
 <a id="6-fixed-depth-asynchronous-engine-plan"></a>
 ## Fixed-depth asynchronous engine plan
 
@@ -168,7 +198,8 @@ With an assigned NPU visible and `MODEL` set as above:
 VLLM_RLT_OURO_CHECKPOINT="$MODEL" python -m pytest -q --run-npu \
   tests/test_ascend_eager.py tests/test_ascend_kv.py \
   tests/test_ascend_decode_scheduling.py \
-  tests/test_ascend_checkpoint.py tests/test_ascend_serving.py
+  tests/test_ascend_checkpoint.py tests/test_ascend_serving.py \
+  tests/test_ascend_prefix_cache_contract.py
 ```
 
 For broader evaluation, see [accuracy](../accuracy.md) and

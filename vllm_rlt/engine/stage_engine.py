@@ -93,6 +93,9 @@ class StageEngine:
                 )
             if self.exit_config.mode != "ouro":
                 raise ValueError("Inkling 2 Mini runs the configured number of passes")
+        staged_prefill = requires_staged_prefill(
+            scheduler_config, produces_tokens=self.stage_config.produces_tokens
+        )
         if parameter.device.type == "npu":
             if config.to_dict()["model_type"] != "ouro" or config.total_ut_steps != 4:
                 raise ValueError("NPU currently supports Ouro with four loops")
@@ -106,17 +109,27 @@ class StageEngine:
                 or speculative_config is not None
                 or self.stage_config.role != "prefill_decode"
                 or scheduler_config.enable_preemption
-                or cache_config.enable_prefix_caching
                 or cache_config.layout != "last_exited"
                 or self.exit_config.mode not in ("ouro", "ouro_delayed")
             ):
                 raise ValueError(
                     "NPU Ouro requires local execution, ouro/ouro_delayed exit mode and "
-                    "last_exited KV without speculation, graphs, preemption or prefix caching"
+                    "last_exited KV without speculation, graphs or preemption"
                 )
-        staged_prefill = requires_staged_prefill(
-            scheduler_config, produces_tokens=self.stage_config.produces_tokens
-        )
+            if cache_config.enable_prefix_caching and (
+                attention_backend != "ascend_eager"
+                or self.execution_config.async_scheduling
+                or self.execution_config.multi_stream
+                or self.execution_config.static_buffers
+                or staged_prefill
+                or cache_config.incremental_allocation
+                or self.exit_config.mode != "ouro"
+            ):
+                raise ValueError(
+                    "NPU Ouro requires local execution. Prefix caching requires "
+                    "synchronous single-stream ascend_eager, "
+                    "ordinary prefill, ouro exit mode and fully reserved KV"
+                )
         sliding_window = getattr(model, "requires_sliding_window", False)
         prefer_packed = packed_prefill_eligible(
             self.execution_config,
