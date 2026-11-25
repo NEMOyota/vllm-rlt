@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from benchmarks import ascend_main_prefix_matrix as matrix
 from benchmarks import ascend_pr1_failure_seeds as sweep
+from benchmarks import ascend_pr1_seed_evidence as evidence
 from benchmarks.ascend_main_prefix_results import Report, ids_digest
 from tests.test_ascend_main_prefix_experiments import cpu_model  # noqa: F401
 
@@ -63,6 +64,15 @@ def test_case_summary_preserves_failed_and_missing_seeds(tmp_path, cpu_model):  
         "8",
     )
     assert rows[-1]["status"] == "INCOMPLETE" and not rows[-1]["off_vs_miss"]
+    report = evidence.collect(tmp_path, case)
+    assert report["summary"]["incomplete"] == 9
+    assert [row["seed"] for row in report["rows"]] == ["169", "170"]
+    details = report["failed_seed_evidence"][169]
+    assert len([event for event in details if event["kind"] == "TRIAL"]) == 6
+    assert (
+        next(event["all_issues"] for event in details if event["kind"] == "CASE_DETAILS")
+        == saved["all_issues"]
+    )
 
 
 def test_eight_cards_partition_ten_seeds_once(capsys):
@@ -72,3 +82,15 @@ def test_eight_cards_partition_ten_seeds_once(capsys):
         range(169, 179)
     )
     assert len(plan["cases"]) == 6 and plan["rounds"] == 2
+
+
+def test_b4_failure_can_be_replayed_on_b3_on_one_selected_card(capsys):
+    assert (
+        sweep.main(
+            ["--chip", "910B3", "--cards", "5,3", "--case", "p1024_s8", "--seed", "168", "--plan"]
+        )
+        == 0
+    )
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["cases"] == ["p1024_s8"] and plan["seeds"] == [168]
+    assert plan["assignments"] == {"5": [168]}

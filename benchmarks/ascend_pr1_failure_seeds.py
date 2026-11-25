@@ -30,13 +30,14 @@ def write_json(path, data):
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
-def run_card(chip, card, seeds, precision, model_dir, out):
+def run_card(chip, card, seeds, cases, precision, model_dir, out):
     os.environ["ASCEND_RT_VISIBLE_DEVICES"] = str(card)
     os.environ["RLT_BENCH_DTYPE"] = "float16" if precision == "fp16" else "bfloat16"
     state = {
         "card": card,
         "chip": chip,
         "seeds": seeds,
+        "cases": cases,
         "precision": precision,
         "status": "INCOMPLETE",
     }
@@ -91,7 +92,7 @@ def run_card(chip, card, seeds, precision, model_dir, out):
                         args,
                         model,
                         report,
-                        list(CASES[chip]),
+                        cases,
                         modes=("main",),
                         seed=seed,
                         linear_work=work,
@@ -108,7 +109,8 @@ def run_card(chip, card, seeds, precision, model_dir, out):
         write_json(state_path, state)
 
 
-def summarize(out, chip, precision, assignments, workers_ok):
+def summarize(out, chip, precision, assignments, workers_ok, *, cases=None):
+    cases = CASES[chip] if cases is None else cases
     rows = []
     for card, seeds in assignments.items():
         for seed in seeds:
@@ -131,7 +133,7 @@ def summarize(out, chip, precision, assignments, workers_ok):
                             )
                         elif event["kind"] == "INPUTS":
                             target_counts[event["case"]] = len(event["prompts"])
-            for case in CASES[chip]:
+            for case in cases:
                 issues = details.get(case)
                 counts = Counter(item.get("comparison", "control") for item in issues or [])
                 compared = {}
@@ -194,7 +196,7 @@ def summarize(out, chip, precision, assignments, workers_ok):
             ]
             for status_name in ("PASS", "FAIL", "INCOMPLETE")
         }
-        for case in CASES[chip]
+        for case in cases
     }
     write_json(out / "summary.json", result)
     print(json.dumps(result), flush=True)
@@ -204,6 +206,15 @@ def summarize(out, chip, precision, assignments, workers_ok):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--chip", required=True, choices=CASES)
+    parser.add_argument(
+        "--seed", type=int, action="append", help="prompt seed; repeat to select several"
+    )
+    parser.add_argument(
+        "--case",
+        action="append",
+        choices=sorted(set().union(*CASES.values())),
+        help="select a historical failure from either chip; repeat to select several",
+    )
     parser.add_argument(
         "--precision",
         choices=("bf16", "fp16", "fp32-linear"),
@@ -226,7 +237,10 @@ def main(argv=None):
         parser.error("--cards requires comma-separated integers")
     if len(set(cards)) != len(cards) or min(cards) < 0 or len(cards) > len(SEEDS):
         parser.error("provide at most ten distinct nonnegative card indices")
-    assignments = {card: SEEDS[index :: len(cards)] for index, card in enumerate(cards)}
+    seeds = list(dict.fromkeys(args.seed or SEEDS))
+    cases = list(dict.fromkeys(args.case or CASES[args.chip]))
+    cards = cards[: len(seeds)]
+    assignments = {card: seeds[index :: len(cards)] for index, card in enumerate(cards)}
     plan = dict(
         chip=args.chip,
         cann=CANN,
@@ -234,8 +248,8 @@ def main(argv=None):
         rounds=ROUNDS,
         output_tokens=16,
         loops=4,
-        cases=CASES[args.chip],
-        seeds=SEEDS,
+        cases=cases,
+        seeds=seeds,
         arms=["off", "miss", "reuse"],
         assignments=assignments,
     )
@@ -249,6 +263,7 @@ def main(argv=None):
             args.chip,
             args.worker_card,
             assignments[args.worker_card],
+            cases,
             args.precision,
             args.model,
             args.out_dir,
@@ -302,6 +317,10 @@ def main(argv=None):
                     "--worker-card",
                     str(card),
                 ]
+                for seed in args.seed or []:
+                    cmd.extend(["--seed", str(seed)])
+                for case in args.case or []:
+                    cmd.extend(["--case", case])
                 worker = stack.enter_context(
                     subprocess.Popen(cmd, cwd=tree, stdout=log, stderr=subprocess.STDOUT)
                 )
@@ -311,7 +330,7 @@ def main(argv=None):
     except (OSError, subprocess.CalledProcessError) as exc:
         (out / "setup-error.txt").write_text(str(exc) + "\n", encoding="utf-8")
         print(exc, file=sys.stderr)
-    return summarize(out, args.chip, args.precision, assignments, success)
+    return summarize(out, args.chip, args.precision, assignments, success, cases=cases)
 
 
 if __name__ == "__main__":
