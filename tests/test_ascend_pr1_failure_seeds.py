@@ -2,6 +2,8 @@ import csv
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from benchmarks import ascend_main_prefix_matrix as matrix
 from benchmarks import ascend_pr1_failure_seeds as sweep
 from benchmarks import ascend_pr1_seed_evidence as evidence
@@ -15,7 +17,7 @@ def test_seed_changes_targets_without_changing_planned_hits():
         historical = matrix.combo.workload(case, 1024)
         assert historical == matrix.combo.workload(case, 1024, seed=168)
         seen = {ids_digest(historical[2]["target-0"])}
-        for seed in sweep.SEEDS:
+        for seed in (*sweep.SEEDS, *sweep.BF16_SEEDS_30):
             donor, miss, targets, _ = matrix.combo.workload(case, 1024, seed=seed)
             seen.add(ids_digest(targets["target-0"]))
             for rid, tokens in targets.items():
@@ -23,7 +25,7 @@ def test_seed_changes_targets_without_changing_planned_hits():
                 start = case.starts("reuse")[rid]
                 assert tokens[:start] == donor[:start]
                 assert tokens[start] != donor[start]
-        assert len(seen) == 11
+        assert len(seen) == 41
 
 
 def test_case_summary_preserves_failed_and_missing_seeds(tmp_path, cpu_model):  # noqa: F811
@@ -82,6 +84,43 @@ def test_eight_cards_partition_ten_seeds_once(capsys):
         range(169, 179)
     )
     assert len(plan["cases"]) == 6 and plan["rounds"] == 2
+
+
+@pytest.mark.parametrize(
+    ("chip", "cards", "expected_cases"),
+    [
+        ("910B3", "0,1,2,3,4,5,6,7", ["c4_h3", "c4_h4", "p128_s128", "p384_s8", "p512_s8"]),
+        ("910B4", "0", ["c4_h3", "c4_h4", "p128_s128", "p1024_s8", "p256_s8", "total512_p384"]),
+    ],
+)
+def test_stratified_bf16_replay_plan(capsys, chip, cards, expected_cases):
+    assert sweep.main(["--chip", chip, "--cards", cards, "--bf16-30-seeds", "--plan"]) == 0
+    plan = json.loads(capsys.readouterr().out)
+    seeds = plan["seeds"]
+    assert len(seeds) == len(set(seeds)) == 30 and not set(seeds).intersection(range(168, 179))
+    span = 2**31
+    for i, seed in enumerate(sorted(seeds)):
+        assert i * span // 30 <= seed < (i + 1) * span // 30
+    assert seeds == list(sweep.BF16_SEEDS_30)
+    assert sorted(s for batch in plan["assignments"].values() for s in batch) == sorted(seeds)
+    assert plan["cases"] == expected_cases
+    assert plan["precision"] == "bf16" and plan["cann"] == "9.0.0"
+    assert plan["arms"] == ["off", "miss", "reuse"] and plan["rounds"] == 2
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--precision", "fp16"],
+        ["--precision", "fp32-linear"],
+        ["--case", "p1024_s8"],
+        ["--seed", "168"],
+    ],
+)
+def test_fixed_bf16_campaign_rejects_overrides(options):
+    with pytest.raises(SystemExit) as error:
+        sweep.main(["--chip", "910B3", "--bf16-30-seeds", "--plan", *options])
+    assert error.value.code == 2
 
 
 def test_b4_failure_can_be_replayed_on_b3_on_one_selected_card(capsys):

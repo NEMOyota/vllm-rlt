@@ -18,6 +18,40 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 SEEDS = tuple(range(169, 179))
+# One random draw per equal-width stratum of [0, 2**31), shuffled once before
+# either chip was tested. Freeze the order so both hosts replay the same inputs.
+BF16_SEEDS_30 = (
+    1109648318,
+    1727668039,
+    1059945226,
+    1443766105,
+    1699062105,
+    1593979132,
+    1258657849,
+    1893393689,
+    273728779,
+    797543261,
+    700954282,
+    1406478784,
+    1332156500,
+    942743421,
+    891809316,
+    207493098,
+    2081658344,
+    421559278,
+    641794792,
+    482563560,
+    1995089171,
+    114281796,
+    2016684385,
+    1560366951,
+    1849591969,
+    770929007,
+    16672712,
+    561128055,
+    355234819,
+    1179450028,
+)
 CASES = {
     "910B3": ("c4_h3", "c4_h4", "p128_s128", "p384_s8", "p512_s8"),
     "910B4": ("c4_h3", "c4_h4", "p128_s128", "p1024_s8", "p256_s8", "total512_p384"),
@@ -207,6 +241,11 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--chip", required=True, choices=CASES)
     parser.add_argument(
+        "--bf16-30-seeds",
+        action="store_true",
+        help="run 30 stratified prompt seeds on this chip's historical native BF16 failures",
+    )
+    parser.add_argument(
         "--seed", type=int, action="append", help="prompt seed; repeat to select several"
     )
     parser.add_argument(
@@ -237,7 +276,11 @@ def main(argv=None):
         parser.error("--cards requires comma-separated integers")
     if len(set(cards)) != len(cards) or min(cards) < 0 or len(cards) > len(SEEDS):
         parser.error("provide at most ten distinct nonnegative card indices")
-    seeds = list(dict.fromkeys(args.seed or SEEDS))
+    if args.bf16_30_seeds and (args.precision != "bf16" or args.seed or args.case):
+        parser.error(
+            "--bf16-30-seeds selects native BF16, the fixed seeds and this chip's failure cases"
+        )
+    seeds = list(BF16_SEEDS_30) if args.bf16_30_seeds else list(dict.fromkeys(args.seed or SEEDS))
     cases = list(dict.fromkeys(args.case or CASES[args.chip]))
     cards = cards[: len(seeds)]
     assignments = {card: seeds[index :: len(cards)] for index, card in enumerate(cards)}
@@ -270,9 +313,8 @@ def main(argv=None):
         )
         return 0
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    out = (
-        args.out_dir or Path("results") / f"pr1-failure-seeds-{args.chip}-{args.precision}-{stamp}"
-    )
+    prefix = "pr1-failure-seeds30" if args.bf16_30_seeds else "pr1-failure-seeds"
+    out = args.out_dir or Path("results") / f"{prefix}-{args.chip}-{args.precision}-{stamp}"
     try:
         out.mkdir(parents=True, exist_ok=False)
     except FileExistsError:
@@ -317,6 +359,8 @@ def main(argv=None):
                     "--worker-card",
                     str(card),
                 ]
+                if args.bf16_30_seeds:
+                    cmd.append("--bf16-30-seeds")
                 for seed in args.seed or []:
                     cmd.extend(["--seed", str(seed)])
                 for case in args.case or []:
