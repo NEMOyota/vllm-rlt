@@ -224,17 +224,20 @@ def comparisons(rounds, modes=MODES):
     return {name: savings(timings(a), timings(b)) for name, a, b in pairs}
 
 
-def run_cases(args, model, report, names, *, linear_work=None, modes=MODES):
+def run_cases(args, model, report, names, *, linear_work=None, modes=MODES, seed=combo.SEED):
     failed, csv_rows = [], []
     failed_comparisons = {}
     benefit_by_case = {}
     for name in names:
         print("Starting", name, flush=True)
         case = FULL[name]
-        inputs = combo.workload(case, model.config.vocab_size)
+        inputs = combo.workload(case, model.config.vocab_size, seed=seed)
         report.record(
             "INPUTS",
             case=name,
+            seed=seed,
+            donor_sha256=ids_digest(inputs[0]),
+            miss_sha256=ids_digest(inputs[1]),
             prompts={rid: ids_digest(tokens) for rid, tokens in inputs[2].items()},
         )
         first = {}

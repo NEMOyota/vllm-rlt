@@ -75,9 +75,9 @@ CASES = {
 }
 
 
-def workload(case, vocab):
-    """Keep the seed-168 targets and donor mutations of ascend_prefix_workload._prompts."""
-    rng = random.Random(SEED)
+def workload(case, vocab, *, seed=SEED):
+    """Generate paired donors and targets; preserve the historical seed by default."""
+    rng = random.Random(seed)
     target = rng.choices(range(vocab), k=case.prefix + case.suffix)
     donor = target.copy()
     if case.suffix:
