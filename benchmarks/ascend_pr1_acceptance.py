@@ -8,22 +8,24 @@ from docs/recipes/ouro_ascend.md at 6e5392d. PR1 uses ordinary prefill and 16-to
 KV pages. Fixed cold/hit cohorts and the self-warming closed loop are recorded
 separately. The ten fixed seeds select the prompt token IDs for both chips.
 
+  git clone --single-branch -b test/ascend-pr1-classified https://github.com/NEMOyota/vllm-rlt.git
+  cd vllm-rlt
+  export MODEL=/models/Ouro-1.4B
   python benchmarks/ascend_pr1_acceptance.py plan --chip 910B4
-  python benchmarks/ascend_pr1_acceptance.py run --chip 910B4 \
-      --cards 0,1,2,3,4,5,6,7 --model /models/Ouro-1.4B --repo /path/to/candidate-repo \
-      --candidate 606a60c --upstream 4821d47 --out results-b4
-  python benchmarks/ascend_pr1_acceptance.py report results-b3 results-b4
+  python benchmarks/ascend_pr1_acceptance.py run --chip 910B4 --cases p1024_s8
+  python benchmarks/ascend_pr1_acceptance.py run --chip 910B4
+  python benchmarks/ascend_pr1_acceptance.py report results-910B3 results-910B4
 
 Both machines use the same built-in seed list. To export it, run
 `python benchmarks/ascend_pr1_acceptance.py seeds pr1-fixed-seeds.json`.
 On either chip the seeds rotate across the selected cards in their listed
-order. All cache arms, repeats and precision replays for
-a seed stay on its assigned card. Fixed checks run once on the first card.
-The repo must contain the candidate and (for paired regression) upstream commits.
-The runner copies pinned benchmark helpers into disposable checkouts.
-For offline machines pass --harness-repo
-pointing to a checkout of NEMOyota/vllm-rlt, test/ascend-pr1-bf16-seeds, with
-136a775 present. Otherwise the runner can fetch this immutable revision.
+order. All cache arms, repeats and precision replays for a seed stay on its
+assigned card. Fixed checks run once on the first card.
+The checkout includes benchmarks/ascend_pr1_package/pr1-fixed10-tests.bundle with
+candidate 606a60c, its regression base 4821d47 and the pinned harness. The runner
+reads missing Git objects from this bundle into a temporary checkout. To test
+another local checkout or bundle, use --repo or --candidate-bundle together
+with --candidate. The report records the full SHA used for inference.
 Select categories with --categories 1,2,4. Report paths are relative to the run.
 For a focused replay use --categories 2 --cases p1024_s8.
 Exit codes: 0 selected checks passed, 1 measured failures, 2 incomplete execution.
@@ -57,6 +59,8 @@ from xml.etree import ElementTree
 
 HARNESS_SHA = "136a775e02c8c63ac5335970189a1d50b6c3d4f2"
 HARNESS_URL = "https://github.com/NEMOyota/vllm-rlt.git"
+CANDIDATE_SHA = "606a60ce9bacdd5df1d25168d38665b3a0ef106d"
+UPSTREAM_SHA = "4821d47cec92aa1d7d2ec4be5f589d19b2794ae3"
 FIXED_SEEDS = (
     114281796,
     273728779,
@@ -70,6 +74,8 @@ FIXED_SEEDS = (
     1727668039,
 )
 SCRIPT = Path(__file__).resolve()
+PACKAGE_DIR = SCRIPT.parent / "ascend_pr1_package"
+CANDIDATE_BUNDLE_NAME = "ascend-ouro-prefix-cache.bundle"
 MODULE = "ascend_pr1_acceptance"
 CATEGORIES = {
     1: "功能正确性",
@@ -168,6 +174,25 @@ def require(ok, message):
 
 def git(repo, *args):
     return subprocess.check_output(["git", "-C", str(repo), *map(str, args)], text=True).strip()
+
+
+def commit_sha(repo, ref):
+    proc = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "rev-parse",
+            "--quiet",
+            "--verify",
+            "--end-of-options",
+            ref + "^{commit}",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    return proc.stdout.strip() if proc.returncode == 0 else None
 
 
 def seed_list(path):
@@ -1609,16 +1634,9 @@ def failed_jobs(root, jobs):
 
 
 def harness_repo(repo, override, tmp):
-    source = override or repo
-    if (
-        subprocess.run(
-            ["git", "-C", str(source), "cat-file", "-e", HARNESS_SHA + "^{commit}"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        ).returncode
-        == 0
-    ):
-        return source
+    for source in (override,) if override else (repo, SCRIPT.parents[1]):
+        if commit_sha(source, HARNESS_SHA):
+            return source
     if override:
         raise ValueError(f"{override} does not contain pinned harness {HARNESS_SHA}")
     source = tmp / "harness"
@@ -1913,66 +1931,82 @@ def summary(root, *, save=True):
     return cfg, status, md
 
 
-def run(args, cfg):
+def runtime_checkout(args, tmp):
     repo = args.repo.resolve()
-    try:
-        candidate = git(
-            repo, "rev-parse", "--verify", "--end-of-options", args.candidate + "^{commit}"
-        )
-    except subprocess.CalledProcessError as exc:
+    pristine = tmp / "pristine"
+    subprocess.run(["git", "clone", "-q", "--no-checkout", str(repo), str(pristine)], check=True)
+
+    def local_revision(ref):
+        sha = commit_sha(repo, ref)
+        # Detached refs in linked worktrees can be absent from clone's refs.
+        if sha and not commit_sha(pristine, sha):
+            git(pristine, "fetch", "-q", "--no-tags", repo, sha)
+        return sha or commit_sha(pristine, ref)
+
+    candidate, upstream = local_revision(args.candidate), local_revision(args.upstream)
+    kit = PACKAGE_DIR / "pr1-fixed10-tests.bundle"
+    if kit.is_file() and not (candidate and upstream and commit_sha(pristine, HARNESS_SHA)):
+        git(pristine, "bundle", "unbundle", kit)
+        candidate = candidate or commit_sha(pristine, args.candidate)
+        upstream = upstream or commit_sha(pristine, args.upstream)
+    bundle = args.candidate_bundle
+    if bundle is None and not candidate:
+        for directory in (repo, PACKAGE_DIR, Path.cwd()):
+            path = directory / CANDIDATE_BUNDLE_NAME
+            if path.is_file():
+                bundle = path
+                break
+    if bundle is not None:
+        git(pristine, "bundle", "unbundle", bundle.resolve())
+        candidate = candidate or commit_sha(pristine, args.candidate)
+        upstream = upstream or commit_sha(pristine, args.upstream)
+    if not candidate:
         raise ValueError(
-            f"candidate {args.candidate} unavailable in {repo}. "
-            "Import the candidate bundle or pass --repo."
-        ) from exc
-    try:
-        upstream = git(
-            repo, "rev-parse", "--verify", "--end-of-options", args.upstream + "^{commit}"
+            f"candidate {args.candidate} unavailable in {repo} and packaged objects. "
+            "Pass --repo or --candidate-bundle with the requested commit."
         )
-    except subprocess.CalledProcessError:
-        upstream = None
+    git(pristine, "checkout", "-q", "--detach", candidate)
+    return pristine, candidate, upstream
+
+
+def run(args, cfg):
     model = args.model.resolve()
     if not model.is_dir():
         raise ValueError(f"checkpoint directory missing: {model}")
-    out = args.out.resolve()
-    out.mkdir(parents=True, exist_ok=False)
-    cfg.update(
-        candidate_sha=candidate,
-        upstream_sha=upstream,
-        upstream=args.upstream,
-        model=str(model),
-        out=str(out),
-        script_sha256=hashlib.sha256(SCRIPT.read_bytes()).hexdigest(),
-    )
-    cpus = sorted(os.sched_getaffinity(0))
-    cards = cfg["cards"]
-    cfg["cpu_affinity"] = {
-        str(card): cpus[i :: len(cards)] or [cpus[i % len(cpus)]] for i, card in enumerate(cards)
-    }
-    write(out / "run.json", cfg)
-    print("RESULTS", out, flush=True)
-    jobs = [Job(**j) for j in cfg["jobs"]]
+    cases = cfg["case_filter"]
+    suffix = ""
+    if len(cases) == 1:
+        suffix = "-" + cases[0]
+    elif cases or len(cfg["categories"]) < len(CATEGORIES):
+        suffix = "-selected"
+    out = (args.out or Path(f"results-{cfg['chip']}{suffix}")).resolve()
+    if out.exists():
+        raise FileExistsError(f"{out} already exists; pass --out with a new directory")
     with tempfile.TemporaryDirectory(prefix="rlt-pr1-") as scratch:
         tmp = Path(scratch)
+        pristine, candidate, upstream = runtime_checkout(args, tmp)
+        out.mkdir(parents=True, exist_ok=False)
+        cfg.update(
+            candidate_sha=candidate,
+            upstream_sha=upstream,
+            upstream=args.upstream,
+            model=str(model),
+            out=str(out),
+            pristine=str(pristine),
+            script_sha256=hashlib.sha256(SCRIPT.read_bytes()).hexdigest(),
+        )
+        cpus = sorted(os.sched_getaffinity(0))
+        cards = cfg["cards"]
+        cfg["cpu_affinity"] = {
+            str(card): cpus[i :: len(cards)] or [cpus[i % len(cpus)]]
+            for i, card in enumerate(cards)
+        }
+        write(out / "run.json", cfg)
+        print("RESULTS", out, flush=True)
+        jobs = [Job(**j) for j in cfg["jobs"]]
         try:
-            source = harness_repo(repo, args.harness_repo, tmp)
-            pristine = tmp / "pristine"
-            subprocess.run(
-                ["git", "clone", "-q", "--no-checkout", str(repo), str(pristine)], check=True
-            )
-            # A linked worktree may contain a detached candidate absent from local branch refs.
-            if subprocess.run(
-                ["git", "-C", str(pristine), "cat-file", "-e", candidate + "^{commit}"],
-                stderr=subprocess.DEVNULL,
-            ).returncode:
-                git(pristine, "fetch", "-q", repo, candidate)
-            git(pristine, "checkout", "-q", "--detach", candidate)
-            cfg["pristine"] = str(pristine)
+            source = harness_repo(pristine, args.harness_repo, tmp)
             if upstream and 6 in cfg["categories"]:
-                if subprocess.run(
-                    ["git", "-C", str(pristine), "cat-file", "-e", upstream + "^{commit}"],
-                    stderr=subprocess.DEVNULL,
-                ).returncode:
-                    git(pristine, "fetch", "-q", repo, upstream)
                 up = tmp / "upstream"
                 git(pristine, "worktree", "add", "-q", "--detach", up, upstream)
                 cfg["upstream_tree"] = str(up)
@@ -2055,15 +2089,28 @@ def cli(argv=None):
         )
         if cmd == "run":
             p.add_argument(
-                "--repo", type=Path, default=Path.cwd(), help="local Git repo with candidate/base"
+                "--repo",
+                type=Path,
+                default=os.getenv("CANDIDATE_REPO", Path.cwd()),
+                help="source repository (CANDIDATE_REPO or current checkout)",
             )
-            p.add_argument("--candidate", default="606a60c")
-            p.add_argument("--upstream", default="4821d47")
+            p.add_argument("--candidate", default=CANDIDATE_SHA)
+            p.add_argument("--upstream", default=UPSTREAM_SHA)
+            p.add_argument(
+                "--candidate-bundle",
+                type=Path,
+                default=os.getenv("CANDIDATE_BUNDLE"),
+                help="optional additional Git bundle containing the requested candidate",
+            )
             p.add_argument("--model", type=Path, default=os.getenv("MODEL"))
             p.add_argument(
                 "--harness-repo", type=Path, help="local git repo containing pinned helpers"
             )
-            p.add_argument("--out", type=Path, required=True, help="new run directory")
+            p.add_argument(
+                "--out",
+                type=Path,
+                help="new directory (default: results-CHIP, with a suffix for a subset)",
+            )
     rep = subs.add_parser("report", help="render one or more matching chip runs as Markdown")
     rep.add_argument("roots", nargs="+", type=Path)
     worker_cmd = subs.add_parser("_worker", help=argparse.SUPPRESS)
