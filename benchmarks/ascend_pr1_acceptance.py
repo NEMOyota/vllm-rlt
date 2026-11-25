@@ -11,13 +11,16 @@ separately. A generated seed selects actual prompt IDs, not sampling noise.
   python benchmarks/ascend_pr1_acceptance.py seeds seeds.json
   python benchmarks/ascend_pr1_acceptance.py plan --seeds seeds.json --chip 910B4
   python benchmarks/ascend_pr1_acceptance.py run --seeds seeds.json --chip 910B4 \
-      --cards 0 --model /models/Ouro-1.4B --repo /path/to/candidate-repo \
+      --cards 0,1,2,3,4,5,6,7 --model /models/Ouro-1.4B --repo /path/to/candidate-repo \
       --candidate 606a60c --upstream 4821d47 --out results-b4
   python benchmarks/ascend_pr1_acceptance.py report results-b3 results-b4
 
-Copy the SAME seeds.json to both machines. The repo must contain the candidate
-and (for paired regression) upstream commits. The runner copies pinned benchmark
-helpers into disposable checkouts. For offline machines pass --harness-repo
+Copy the SAME seeds.json to both machines. On either chip, seeds rotate across
+the selected cards in order. All cache arms, repeats and precision replays for
+a seed stay on its assigned card. Fixed checks run once on the first card.
+The repo must contain the candidate and (for paired regression) upstream commits.
+The runner copies pinned benchmark helpers into disposable checkouts.
+For offline machines pass --harness-repo
 pointing to a checkout of NEMOyota/vllm-rlt, test/ascend-pr1-bf16-seeds, with
 136a775 present. Otherwise the runner can fetch this immutable revision.
 Select categories with --categories 1,2,4. Report paths are relative to the run.
@@ -2019,7 +2022,12 @@ def cli(argv=None):
         p = subs.add_parser(cmd)
         p.add_argument("--seeds", type=Path, required=True)
         p.add_argument("--chip", choices=("910B3", "910B4"), required=True)
-        p.add_argument("--cards", default=os.getenv("ASCEND_RT_VISIBLE_DEVICES", "0"))
+        p.add_argument(
+            "--cards",
+            default=os.getenv("ASCEND_RT_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7"),
+            help="ordered physical card IDs, comma-separated "
+            "(default: ASCEND_RT_VISIBLE_DEVICES if set, otherwise 0 through 7)",
+        )
         p.add_argument(
             "--categories", default="1,2,3,4,5,6,7", help="comma-separated category numbers"
         )
