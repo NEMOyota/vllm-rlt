@@ -6,17 +6,18 @@ The CLI for seeds, plan and report needs only Python's standard library.
 W1-W5 reuse the lengths, concurrency, resident limits and measurement windows
 from docs/recipes/ouro_ascend.md at 6e5392d. PR1 uses ordinary prefill and 16-token
 KV pages. Fixed cold/hit cohorts and the self-warming closed loop are recorded
-separately. A generated seed selects actual prompt IDs, not sampling noise.
+separately. The ten fixed seeds select the prompt token IDs for both chips.
 
-  python benchmarks/ascend_pr1_acceptance.py seeds seeds.json
-  python benchmarks/ascend_pr1_acceptance.py plan --seeds seeds.json --chip 910B4
-  python benchmarks/ascend_pr1_acceptance.py run --seeds seeds.json --chip 910B4 \
+  python benchmarks/ascend_pr1_acceptance.py plan --chip 910B4
+  python benchmarks/ascend_pr1_acceptance.py run --chip 910B4 \
       --cards 0,1,2,3,4,5,6,7 --model /models/Ouro-1.4B --repo /path/to/candidate-repo \
       --candidate 606a60c --upstream 4821d47 --out results-b4
   python benchmarks/ascend_pr1_acceptance.py report results-b3 results-b4
 
-Copy the SAME seeds.json to both machines. On either chip, seeds rotate across
-the selected cards in order. All cache arms, repeats and precision replays for
+Both machines use the same built-in seed list. To export it, run
+`python benchmarks/ascend_pr1_acceptance.py seeds pr1-fixed-seeds.json`.
+On either chip the seeds rotate across the selected cards in their listed
+order. All cache arms, repeats and precision replays for
 a seed stay on its assigned card. Fixed checks run once on the first card.
 The repo must contain the candidate and (for paired regression) upstream commits.
 The runner copies pinned benchmark helpers into disposable checkouts.
@@ -24,7 +25,7 @@ For offline machines pass --harness-repo
 pointing to a checkout of NEMOyota/vllm-rlt, test/ascend-pr1-bf16-seeds, with
 136a775 present. Otherwise the runner can fetch this immutable revision.
 Select categories with --categories 1,2,4. Report paths are relative to the run.
-For a focused replay use --categories 2 --cases p1024_s8 with the shared manifest.
+For a focused replay use --categories 2 --cases p1024_s8.
 Exit codes: 0 selected checks passed, 1 measured failures, 2 incomplete execution.
 """
 
@@ -56,6 +57,18 @@ from xml.etree import ElementTree
 
 HARNESS_SHA = "136a775e02c8c63ac5335970189a1d50b6c3d4f2"
 HARNESS_URL = "https://github.com/NEMOyota/vllm-rlt.git"
+FIXED_SEEDS = (
+    114281796,
+    273728779,
+    355234819,
+    421559278,
+    641794792,
+    770929007,
+    797543261,
+    1179450028,
+    1560366951,
+    1727668039,
+)
 SCRIPT = Path(__file__).resolve()
 MODULE = "ascend_pr1_acceptance"
 CATEGORIES = {
@@ -158,14 +171,12 @@ def git(repo, *args):
 
 
 def seed_list(path):
-    seeds = read(path)["seeds"]
-    if (
-        not isinstance(seeds, list)
-        or len(seeds) != 10
-        or any(type(n) is not int or not 0 <= n < 2**31 for n in seeds)
-        or len(set(seeds)) != 10
-    ):
-        raise ValueError("the shared manifest must contain ten distinct nonnegative 31-bit seeds")
+    seeds = list(FIXED_SEEDS)
+    if path is not None:
+        manifest = read(path)
+        values = manifest.get("seeds") if isinstance(manifest, dict) else None
+        if values != seeds or any(type(n) is not int for n in values):
+            raise ValueError(f"{path} must contain the ten fixed PR1 integer seeds in order")
     return seeds
 
 
@@ -2014,13 +2025,13 @@ def cli(argv=None):
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     subs = parser.add_subparsers(dest="mode", required=True)
-    seeds_cmd = subs.add_parser(
-        "seeds", help="draw ten new seeds once; copy the file to both hosts"
-    )
+    seeds_cmd = subs.add_parser("seeds", help="export the ten fixed PR1 prompt seeds")
     seeds_cmd.add_argument("path", type=Path)
     for cmd in ("plan", "run"):
         p = subs.add_parser(cmd)
-        p.add_argument("--seeds", type=Path, required=True)
+        p.add_argument(
+            "--seeds", type=Path, help="optional manifest matching the built-in PR1 seeds in order"
+        )
         p.add_argument("--chip", choices=("910B3", "910B4"), required=True)
         p.add_argument(
             "--cards",
@@ -2064,12 +2075,10 @@ def cli(argv=None):
     if args.mode == "_worker":
         return worker(args.cfg, args.lane, args.precision, args.progress)
     if args.mode == "seeds":
-        # Exclude the previously reported input seeds from the new experiment.
-        values = random.SystemRandom().sample(range(179, 2**31), 10)
         with args.path.open("x", encoding="utf-8") as f:
-            json.dump({"seeds": values}, f, indent=2)
+            json.dump({"seeds": FIXED_SEEDS}, f, indent=2)
             f.write("\n")
-        print(args.path, values)
+        print(args.path, list(FIXED_SEEDS))
         return 0
     if args.mode == "report":
         reports = [summary(root, save=False) for root in args.roots]
