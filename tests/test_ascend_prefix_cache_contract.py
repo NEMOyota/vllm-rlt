@@ -1,6 +1,8 @@
 """Configuration and page reuse through the supported Ouro engine entry point."""
 
+import json
 import os
+import random
 from dataclasses import replace
 
 import pytest
@@ -19,6 +21,7 @@ from vllm_rlt.device import resolve_device
 from vllm_rlt.engine import stage_engine
 from vllm_rlt.engine.stage_config import StageConfig
 from vllm_rlt.models import OuroForCausalLM
+from vllm_rlt.request import RequestPhase
 
 CACHE = CacheConfig(block_size=16, num_blocks=64, enable_prefix_caching=True)
 SYNC = ExecutionConfig(multi_stream=False, use_uva=False)
@@ -76,20 +79,32 @@ def test_supported_prefix_configuration_reaches_packed_backend(monkeypatch, pack
         engine(npu_model_stub(), execution_config=replace(SYNC, packed_prefill=packed))
 
 
-def generate(runtime, tokens):
+def generate(runtime, tokens, max_tokens=4):
     params = SamplingParams(
-        max_tokens=4, temperature=0, min_loops=4, max_loops=4, exit_threshold=1.0, ignore_eos=True
+        max_tokens=max_tokens,
+        temperature=0,
+        min_loops=4,
+        max_loops=4,
+        exit_threshold=1.0,
+        ignore_eos=True,
     )
     hits_before = runtime.cache_manager.prefix_hits
     runtime.add_request("reused-id", tokens, params)
     finished = []
+    rows = 0
     while runtime.has_unfinished_requests():
         finished.extend(out for out in runtime.step() if out.finished)
+        batch = runtime.last_schedule
+        if batch.phase == RequestPhase.PREFILL:
+            rows += sum(item.token_count for item in batch.requests)
     assert len(finished) == 1
     out = finished[0]
-    assert len(out.token_ids) == 4 and out.exit_depths == [4] * 4 and out.finish_reason == "length"
+    assert len(out.token_ids) == max_tokens and out.exit_depths == [4] * max_tokens
+    assert out.finish_reason == "length"
     assert runtime.cache_manager.num_used_blocks == 0
-    return list(out.token_ids), runtime.cache_manager.prefix_hits - hits_before
+    hit = runtime.cache_manager.prefix_hits - hits_before
+    assert rows == len(tokens) - hit
+    return list(out.token_ids), hit
 
 
 @pytest.fixture(scope="module")
@@ -196,5 +211,167 @@ def test_leaf_eviction_on_ascend(ouro_checkpoint):
         assert (cache.prefix_evictions, cache.prefix_blocks_reclaimed) == (1, 4)
         assert len(cache.lookup_prefix(cold + [9])) == 1
         assert len(cache.lookup_prefix(hot + [9])) == 2
+    finally:
+        runtime.close()
+
+
+def test_generated_prefix_requires_supported_runtime():
+    from tests.helpers import tiny_ouro_config
+
+    with pytest.raises(ValueError, match="requires enable_prefix_caching"):
+        CacheConfig(cache_generated_prefixes=True)
+    with pytest.raises(ValueError, match="Ascend Ouro"):
+        stage_engine.StageEngine(
+            OuroForCausalLM(tiny_ouro_config()),
+            cache_config=replace(CACHE, cache_generated_prefixes=True),
+        )
+
+
+def measure_second_turn(runtime, tokens, start, end):
+    """Capture only the reusable decode span, and the first CODA logits."""
+    cache = runtime.cache_manager
+    before = cache.prefix_hits
+    logits = []
+
+    def capture_first(_module, _inputs, output):
+        if not logits:
+            logits.append(output.detach().reshape(-1, output.shape[-1])[0].float().cpu())
+
+    hook = runtime.model.lm_head.register_forward_hook(capture_first)
+    try:
+        runtime.add_request(
+            "second",
+            tokens,
+            SamplingParams(max_tokens=4, min_loops=4, max_loops=4, ignore_eos=True),
+        )
+        request = runtime.scheduler.requests["second"]
+        while request.num_prefilled_tokens < len(tokens):
+            runtime.step()
+        pages = {}
+        for depth in range(cache.storage_depths):
+            for layer in range(cache.num_layers):
+                k, v = cache.read(layer, "second", depth, end)
+                pages[depth, layer] = torch.stack((k[start:], v[start:])).cpu()
+        outputs = []
+        while runtime.has_unfinished_requests():
+            outputs.extend(out for out in runtime.step() if out.finished)
+        assert len(outputs) == 1 and outputs[0].exit_depths == [4] * 4
+        assert cache.num_used_blocks == 0
+        assert logits[0].argmax().item() == outputs[0].token_ids[0]
+        return cache.prefix_hits - before, pages, logits[0], outputs[0].token_ids
+    finally:
+        hook.remove()
+
+
+@pytest.mark.npu
+@pytest.mark.parametrize(
+    "seed",
+    [
+        114281796,
+        273728779,
+        355234819,
+        421559278,
+        641794792,
+        770929007,
+        797543261,
+        1179450028,
+        1560366951,
+        1727668039,
+    ],
+)
+@torch.inference_mode()
+def test_generated_prefix_two_turn_on_ascend(ouro_checkpoint, seed, record_property):
+    rng = random.Random(seed)
+    prompt = rng.choices(range(8, ouro_checkpoint.config.vocab_size), k=128)
+    suffix = rng.choices(range(8, ouro_checkpoint.config.vocab_size), k=8)
+    # The 64th sampled token has no KV. Only 48 of the 63 forwarded
+    # outputs make complete pages. Turn two includes all 64 output IDs.
+    expected_hits = {"off": 0, "prompt": 128, "generated": 176}
+    history = reference = None
+    evidence = {}
+    for arm, expected in expected_hits.items():
+        runtime = engine(
+            ouro_checkpoint,
+            cache_config=replace(
+                CACHE,
+                enable_prefix_caching=arm != "off",
+                cache_generated_prefixes=arm == "generated",
+            ),
+        )
+        try:
+            donor, donor_hit = generate(runtime, prompt, max_tokens=64)
+            assert donor_hit == 0
+            if history is None:
+                history = prompt + donor + suffix
+            assert history == prompt + donor + suffix
+            hit, pages, logits, output = measure_second_turn(runtime, history, 128, 176)
+            assert hit == expected
+            if reference is None:
+                reference = pages, logits, output
+            ref_pages, ref_logits, _ = reference
+            kv_deltas = {
+                f"d{depth}/l{layer}": (kv.float() - ref_pages[depth, layer].float())
+                .abs()
+                .flatten(1)
+                .amax(1)
+                .tolist()
+                for (depth, layer), kv in pages.items()
+            }
+            top, ids = logits.topk(2)
+            evidence[arm] = dict(
+                hit=hit,
+                output=output,
+                top2=ids.tolist(),
+                top2_margin=(top[0] - top[1]).item(),
+                max_logit_delta=(logits - ref_logits).abs().max().item(),
+                kv_max_abs_k_v=kv_deltas,
+            )
+        finally:
+            runtime.close()
+    # Preserve differences even on failing seeds. No arbitrary BF16 tolerance
+    # is used to turn an output mismatch into a pass.
+    record_property("second_turn", json.dumps(evidence, allow_nan=False))
+    for arm in ("prompt", "generated"):
+        assert evidence[arm]["output"] == evidence["off"]["output"], (seed, arm, evidence[arm])
+
+
+@pytest.mark.parametrize("end", ["length", "stop", "abort"])
+@torch.inference_mode()
+def test_completed_generation_lifecycle_on_cpu_reference(end):
+    from tests.helpers import tiny_ouro_config
+    from vllm_rlt.request import FinishReason
+
+    torch.manual_seed(1)
+    model = OuroForCausalLM(tiny_ouro_config()).eval()
+    runtime = stage_engine.StageEngine(
+        model, cache_config=replace(CACHE, block_size=2), execution_config=SYNC
+    )
+    # Exercise the same finish/release path with real CPU tensors. Enabling the
+    # public option on a non-Ascend engine is tested separately above.
+    runtime.cache_generated_prefixes = True
+    prompt = [1, 2, 3]
+    try:
+        runtime.add_request("r", prompt, SamplingParams(max_tokens=4, min_loops=4, max_loops=4))
+        request = runtime.scheduler.requests["r"]
+        runtime.scheduler.eos_token_ids = ()
+        while len(request.generated_token_ids) < 3:
+            runtime.step()
+        if end == "abort":
+            runtime.abort_request("r")
+        else:
+            if end == "stop":
+                runtime.scheduler.eos_token_ids = tuple(range(model.config.vocab_size))
+            while runtime.has_unfinished_requests():
+                runtime.step()
+        assert request.finish_reason == FinishReason(end)
+        continuation = prompt + request.generated_token_ids + [6]
+        assert len(runtime.cache_manager.lookup_prefix(continuation)) == (
+            1 if end == "abort" else 3
+        )
+        assert runtime.cache_manager.num_used_blocks == 0
+        # Immediate ID reuse must see only its own private suffix.
+        runtime.add_request("r", [9, 10], SamplingParams(max_tokens=1))
+        while runtime.has_unfinished_requests():
+            runtime.step()
     finally:
         runtime.close()

@@ -455,9 +455,9 @@ class KVCacheManager:
             self.publish_prefix(request_id, tokens, length)
 
     def publish_prefix(self, request_id, tokens, length, event=None):
-        """Index complete prompt pages for reuse without copying their KV.
+        """Index complete pages for reuse without copying their KV.
 
-        length is the prefilled extent; len(tokens) is the full prompt length.
+        length is the processed extent of the supplied token history.
         A supplied event defers publication until the GPU writes complete.
         """
         if not self.enable_prefix_caching:
@@ -484,6 +484,14 @@ class KVCacheManager:
             if parent is not None:
                 self._prefixes[parent].children.add(key)
             parent = key
+
+    def publish_generated_prefix(self, request_id, prompt, generated):
+        """Publish completed fixed-loop decode pages after the runner has retired."""
+        # CODA samples the final output but never feeds it back. Avoid hashing
+        # the history again unless decode completed at least one additional page.
+        processed = len(prompt) + len(generated) - 1
+        if processed // self.block_size > len(prompt) // self.block_size:
+            self.publish_prefix(request_id, prompt + generated[:-1], processed)
 
     def lookup_prefix(self, tokens):
         if not self.enable_prefix_caching:

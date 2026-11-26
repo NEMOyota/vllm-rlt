@@ -445,3 +445,18 @@ def test_pinned_leaf_with_independently_computed_ancestor_preserves_capacity():
     for rid in ("duplicate", "other", "pressure"):
         cache.free(rid)
     assert cache.num_free_blocks == cache.num_blocks
+
+
+@pytest.mark.parametrize("generated_count, expected", [(1, 1), (2, 2), (3, 2), (4, 3)])
+def test_generated_prefix_excludes_last_sample_and_partial_pages(generated_count, expected):
+    cache = make_cache(enable_prefix_caching=True, max_loops=4)
+    prompt = [1, 2, 3]
+    generated = list(range(4, 4 + generated_count))
+    assert cache.allocate("r", len(prompt) + generated_count)
+    # Even if storage after the committed frontier appears initialized, the
+    # final sampled token must never be published.
+    cache.mark_imported_prefix("r", len(prompt) + generated_count)
+    cache.publish_prefix("r", prompt, len(prompt))
+    cache.publish_generated_prefix("r", prompt, generated)
+    cache.free("r")
+    assert len(cache.lookup_prefix(prompt + generated + [0])) == expected

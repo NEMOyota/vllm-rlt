@@ -96,6 +96,9 @@ class StageEngine:
         staged_prefill = requires_staged_prefill(
             scheduler_config, produces_tokens=self.stage_config.produces_tokens
         )
+        self.cache_generated_prefixes = cache_config.cache_generated_prefixes
+        if self.cache_generated_prefixes and parameter.device.type != "npu":
+            raise ValueError("generated prefix caching requires the synchronous Ascend Ouro path")
         if parameter.device.type == "npu":
             if config.to_dict()["model_type"] != "ouro" or config.total_ut_steps != 4:
                 raise ValueError("NPU currently supports Ouro with four loops")
@@ -965,6 +968,10 @@ class StageEngine:
         self.model_runner.release(request.request_id)
         self.cache_manager.poll_prefixes()
         self._pending_exit_signals.pop(request.request_id, None)
+        if self.cache_generated_prefixes and reason in (FinishReason.LENGTH, FinishReason.STOP):
+            self.cache_manager.publish_generated_prefix(
+                request.request_id, request.prompt_token_ids, request.generated_token_ids
+            )
         self.scheduler.finish(request, reason)
 
     def _retire_speculative(self, *, wait=False, request_id=None):

@@ -23,13 +23,16 @@ class CacheConfig:
     # "auto" stores KV in the model dtype; "fp8_e4m3" stores float8 e4m3 codes with
     # scales chosen by the engine for the selected attention backend.
     kv_cache_dtype: str = "auto"
+    cache_generated_prefixes: bool = False
 
     def __post_init__(self):
-        for name in ("enable_prefix_caching", "incremental_allocation"):
+        for name in ("enable_prefix_caching", "incremental_allocation", "cache_generated_prefixes"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a boolean")
         if not 0 <= self.watermark_ratio < 1:
             raise ValueError("watermark_ratio must be in [0, 1)")
+        if self.cache_generated_prefixes and not self.enable_prefix_caching:
+            raise ValueError("cache_generated_prefixes requires enable_prefix_caching")
         if self.enable_prefix_caching and self.layout != "last_exited":
             raise ValueError("prefix caching requires last_exited KV")
         if self.num_blocks is not None:

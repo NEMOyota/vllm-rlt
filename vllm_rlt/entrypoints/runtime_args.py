@@ -26,6 +26,11 @@ def add_runtime_args(parser):
     parser.add_argument("--draft-loops", type=int, default=2)
     parser.add_argument("--target-loops", type=int, default=4)
     parser.add_argument("--enable-prefix-caching", action="store_true")
+    parser.add_argument(
+        "--cache-generated-prefixes",
+        action="store_true",
+        help="Experimentally reuse completed decode pages on synchronous Ascend Ouro",
+    )
     parser.add_argument("--incremental-kv", action="store_true")
     parser.add_argument("--kv-watermark", type=float, default=0.0)
     parser.add_argument("--scheduling-policy", choices=["fcfs", "priority"], default="fcfs")
@@ -140,6 +145,7 @@ def runtime_configs(args):
         else None,
         cache_config=CacheConfig(
             enable_prefix_caching=args.enable_prefix_caching,
+            cache_generated_prefixes=args.cache_generated_prefixes,
             incremental_allocation=args.incremental_kv,
             watermark_ratio=args.kv_watermark,
             num_blocks=args.num_blocks,

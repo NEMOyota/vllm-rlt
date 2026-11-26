@@ -574,6 +574,7 @@ def test_engine_yields_while_waiting_for_remote_kv(async_scheduling):
     from vllm_rlt.worker.output import ModelRunnerOutput
 
     engine = object.__new__(LLMEngine)
+    engine.cache_generated_prefixes = False
     engine.async_speculative = False
     engine.pipeline_speculative = False
     engine.speculative_runner = None
