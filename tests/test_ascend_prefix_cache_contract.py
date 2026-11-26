@@ -176,3 +176,25 @@ def test_aligned_donor_tail_on_ascend(ouro_checkpoint):
         finally:
             runtime.close()
     assert results[0] == results[1]
+
+
+@pytest.mark.npu
+@torch.inference_mode()
+def test_leaf_eviction_on_ascend(ouro_checkpoint):
+    shared = list(range(10, 26))
+    cold = shared + list(range(30, 46))
+    hot = shared + list(range(50, 66))
+    runtime = engine(ouro_checkpoint, cache_config=replace(CACHE, num_blocks=24))
+    try:
+        generate(runtime, cold)
+        generate(runtime, hot)
+        cache = runtime.cache_manager
+        assert len(cache.lookup_prefix(hot + [9])) == 2
+        # Six logical pages. Three retained pages plus this four-page
+        # reservation force eviction of exactly one page across four depths.
+        generate(runtime, list(range(100, 148)))
+        assert (cache.prefix_evictions, cache.prefix_blocks_reclaimed) == (1, 4)
+        assert len(cache.lookup_prefix(cold + [9])) == 1
+        assert len(cache.lookup_prefix(hot + [9])) == 2
+    finally:
+        runtime.close()

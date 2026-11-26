@@ -381,3 +381,67 @@ def test_aligned_tail_waits_for_every_layer_and_depth():
     fill_prefix(cache, "donor", [1], depths=[2])
     cache.publish_prefix("donor", tokens, 2)
     assert len(cache.lookup_prefix(tokens + [3])) == 1
+
+
+def test_leaf_eviction_protects_shared_root_and_pinned_branch():
+    cache = make_cache(num_blocks=8, block_size=2, max_loops=2, enable_prefix_caching=True)
+    cold = [1, 2, 3, 4]
+    live = [1, 2, 5, 6]
+    assert cache.allocate("cold", 4)
+    cache.mark_imported_prefix("cold", 4)
+    cache.publish_prefix("cold", cold, 4)
+    cache.free("cold")
+    root = cache.lookup_prefix(live)
+    assert len(root) == 1
+    assert cache.allocate("live", 4, prefix=root)
+    cache.mark_imported_prefix("live", 4, start=2)
+    cache.publish_prefix("live", live, 4)
+    assert cache.allocate("held", 2)
+    assert cache.num_free_blocks == 2
+    assert not cache.allocate("too-big", 4)
+    assert cache.prefix_evictions == 0
+    assert cache.allocate("pressure", 2)
+    assert cache.prefix_evictions == 1 and cache.prefix_blocks_reclaimed == 2
+    assert cache.lookup_prefix(cold + [7]) == root
+    assert len(cache.lookup_prefix(live + [7])) == 2
+    for rid in ("live", "held", "pressure"):
+        cache.free(rid)
+    assert cache.num_free_blocks == cache.num_blocks
+
+
+def test_leaf_eviction_preserves_lru_among_siblings():
+    cache = make_cache(num_blocks=8, block_size=2, max_loops=2, enable_prefix_caching=True)
+    for tail in (3, 4, 5):
+        tokens = [1, 2, tail, tail]
+        hit = cache.lookup_prefix(tokens)
+        assert cache.allocate("writer", 4, prefix=hit)
+        cache.mark_imported_prefix("writer", 4, start=len(hit) * 2)
+        cache.publish_prefix("writer", tokens, 4)
+        cache.free("writer")
+    assert len(cache.lookup_prefix([1, 2, 3, 3, 0])) == 2
+    assert cache.allocate("pressure", 2)
+    assert [len(cache.lookup_prefix([1, 2, t, t, 0])) for t in (3, 4, 5)] == [2, 1, 2]
+
+
+def test_pinned_leaf_with_independently_computed_ancestor_preserves_capacity():
+    cache = make_cache(num_blocks=8, block_size=2, max_loops=2, enable_prefix_caching=True)
+    assert cache.allocate("first", 2) and cache.allocate("duplicate", 4)
+    cache.mark_imported_prefix("first", 2)
+    cache.publish_prefix("first", [1, 2], 2)
+    cache.free("first")
+    tokens = [1, 2, 3, 4]
+    fill_prefix(cache, "duplicate", range(4), depths=range(2), value=3.0)
+    cache.publish_prefix("duplicate", tokens, 4)
+    assert cache.allocate("other", 2)
+    cache.mark_imported_prefix("other", 2)
+    cache.publish_prefix("other", [5, 6], 2)
+    assert cache.allocate("pressure", 2)
+    assert not cache.lookup_prefix(tokens + [7])
+    assert len(cache.lookup_prefix([5, 6, 7])) == 1
+    assert cache.prefix_evictions == 2 and cache.prefix_blocks_reclaimed == 2
+    for depth in range(2):
+        k, v = cache.read(0, "duplicate", depth, 4)
+        assert torch.all(k == 3) and torch.all(v == 3)
+    for rid in ("duplicate", "other", "pressure"):
+        cache.free(rid)
+    assert cache.num_free_blocks == cache.num_blocks

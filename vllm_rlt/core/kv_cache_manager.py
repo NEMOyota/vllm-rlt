@@ -11,6 +11,7 @@ write and dequantized by the attention backends on read.
 """
 
 import hashlib
+import heapq
 import struct
 import weakref
 from collections import OrderedDict
@@ -104,6 +105,13 @@ class _WrittenPositions:
 
     def __contains__(self, position: int) -> bool:
         return position < self.prefix or position in self.pending
+
+
+@dataclass
+class _PrefixPage:
+    blocks: tuple[int, ...]
+    parent: bytes | None
+    children: set[bytes] = field(default_factory=set)
 
 
 @dataclass
@@ -316,7 +324,8 @@ class KVCacheManager:
         # Full allocation already reserves each request's maximum KV capacity.
         self.watermark_blocks = int(watermark_ratio * num_blocks) if incremental_allocation else 0
         self._refs = [0] * num_blocks
-        self._prefixes = OrderedDict()
+        self._prefixes: OrderedDict[bytes, _PrefixPage] = OrderedDict()
+        self.prefix_evictions = self.prefix_blocks_reclaimed = 0
         self._pending_prefixes = []
         self.prefix_hits = self.prefix_queries = 0
         if enable_prefix_caching and layout != "last_exited":
@@ -329,7 +338,7 @@ class KVCacheManager:
     @property
     def num_free_blocks(self) -> int:
         return len(self._free_blocks) + sum(
-            self._refs[b] == 1 for blocks in self._prefixes.values() for b in blocks
+            self._refs[b] == 1 for page in self._prefixes.values() for b in page.blocks
         )
 
     @property
@@ -362,6 +371,53 @@ class KVCacheManager:
             if not self._refs[b]:
                 self._free_blocks.append(b)
 
+    def _evict_leaf(self, key):
+        page = self._prefixes.pop(key)
+        assert not page.children
+        if page.parent is not None:
+            self._prefixes[page.parent].children.remove(key)
+        free_before = len(self._free_blocks)
+        self._drop_refs(page.blocks)
+        self.prefix_evictions += 1
+        self.prefix_blocks_reclaimed += len(self._free_blocks) - free_before
+        return page.parent
+
+    def _evict_prefixes(self, count):
+        # Snapshot LRU ranks only under pressure. Newly exposed parents retain
+        # their original rank. Each ordinary victim releases physical blocks.
+        def reclaimable(page):
+            return any(self._refs[b] == 1 for b in page.blocks)
+
+        rank = {key: i for i, key in enumerate(self._prefixes)}
+        cold = [
+            (rank[key], key)
+            for key, page in self._prefixes.items()
+            if not page.children and reclaimable(page)
+        ]
+        heapq.heapify(cold)
+        while len(self._free_blocks) < count:
+            if cold:
+                _, key = heapq.heappop(cold)
+                parent = self._evict_leaf(key)
+            else:
+                # Concurrent cold producers may have identical tokens but private
+                # physical ancestors. A cache-only ancestor can then be blocked
+                # by live descendants. Prune just that branch, leaves first;
+                # request refs keep its live KV safe. This preserves admission
+                # capacity even when no immediately reclaimable leaf exists.
+                root = next(k for k, p in self._prefixes.items() if reclaimable(p))
+                branch = [root]
+                for key in branch:
+                    branch.extend(sorted(self._prefixes[key].children, key=rank.__getitem__))
+                for key in reversed(branch):
+                    parent = self._evict_leaf(key)
+                    if len(self._free_blocks) >= count:
+                        return
+            if parent is not None:
+                page = self._prefixes[parent]
+                if not page.children and reclaimable(page):
+                    heapq.heappush(cold, (rank[parent], parent))
+
     def _claim(self, count):
         """Take ``count`` free blocks, evicting prefix entries only if that is enough.
 
@@ -373,11 +429,8 @@ class KVCacheManager:
         """
         if len(self._free_blocks) < count and self.num_free_blocks < count:
             return None
-        while len(self._free_blocks) < count and self._prefixes:
-            _, blocks = self._prefixes.popitem(last=False)
-            self._drop_refs(blocks)
         if len(self._free_blocks) < count:
-            return None
+            self._evict_prefixes(count)
         blocks = [self._free_blocks.pop() for _ in range(count)]
         for b in blocks:
             assert self._refs[b] == 0
@@ -414,8 +467,10 @@ class KVCacheManager:
             self._pending_prefixes.append((request_id, allocation, tuple(tokens), length, event))
             return
         # A longer consumer can reuse even a page ending at the donor boundary.
+        parent = None
         for index, key in enumerate(self._prefix_keys(tokens[:length])):
             if key in self._prefixes:
+                parent = key
                 continue
             end = (index + 1) * self.block_size
             # Every depth and layer must have a contiguous written prefix.
@@ -425,7 +480,10 @@ class KVCacheManager:
             blocks = tuple(t[index] for t in allocation.block_tables)
             for b in blocks:
                 self._refs[b] += 1
-            self._prefixes[key] = blocks
+            self._prefixes[key] = _PrefixPage(blocks, parent)
+            if parent is not None:
+                self._prefixes[parent].children.add(key)
+            parent = key
 
     def lookup_prefix(self, tokens):
         if not self.enable_prefix_caching:
@@ -434,11 +492,11 @@ class KVCacheManager:
         found = []
         # We cache KV, so the consumer must still compute its final hidden state.
         for key in self._prefix_keys(tokens[:-1]):
-            blocks = self._prefixes.get(key)
-            if blocks is None:
+            page = self._prefixes.get(key)
+            if page is None:
                 break
             self._prefixes.move_to_end(key)
-            found.append(blocks)
+            found.append(page.blocks)
         return tuple(found)
 
     def allocate(self, request_id: str, max_tokens: int, *, initial_tokens=None, prefix=()) -> bool:
