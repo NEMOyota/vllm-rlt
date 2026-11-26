@@ -9,14 +9,18 @@ export MODEL=/models/Ouro-1.4B
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 ```
 
-在 B3 设置 `export CHIP=910B3`，在 B4 设置 `export CHIP=910B4`。两台都使用下列命令。定向排查和全量计时在同一台机器上依次运行。
+在 B3 设置 `export CHIP=910B3`，在 B4 设置 `export CHIP=910B4`。以下命令只测引擎性能。
 
 ```bash
-python benchmarks/ascend_pr1_acceptance.py run --chip "$CHIP" --cases p1024_s8
-python benchmarks/ascend_pr1_acceptance.py run --chip "$CHIP"
+python benchmarks/ascend_pr1_acceptance.py run --chip "$CHIP" --categories 3 \
+  --cases W1,W2,W3,W4,W5 --out "results-$CHIP-perf-isolated"
 ```
 
-定向结果在 `results-$CHIP-p1024_s8/`，七类全量结果在 `results-$CHIP/`。重跑时可用 `--out 新目录`。查看 `summary.csv` 的 `bf16_first_issue` 列可定位首个分歧，`followups.json` 列出同卡补测 FP16 和固定 256 行 FP32 Linear 的用例。
+每种精度依次运行 W1～W5。每个负载按固定种子分卡，每个种子使用独立进程。全部卡上当前负载的进程退出后，才启动下一个负载。在同一种子的进程内，每次 off、miss、reuse 测量结束后都会关闭引擎、回收循环引用、释放 NPU 分配器的空闲缓存并检查旧 K/V 张量已释放。计时覆盖实际请求，共享前缀照常在预热后供目标请求复用。
+
+各用例目录下的 `replay-memory.jsonl` 按轮次记录进程号、建池前后和回收后的显存字节数；成功回收的记录为 `stage=after_cleanup, kv_released=true`。回收后的已分配显存仍包含该进程的模型权重。若某次建池 OOM，可用最后一条记录和 `result.json` 的异常栈定位。
+
+要测七类全量，使用 `python benchmarks/ascend_pr1_acceptance.py run --chip "$CHIP"`。全量结果在 `results-$CHIP/`。重跑时用 `--out` 指定新目录。查看 `summary.csv` 的 `bf16_first_issue` 列可定位首个分歧，`followups.json` 列出同卡补测 FP16 和固定 256 行 FP32 Linear 的用例。
 
 两台均使用固定的十个种子，按顺序轮转到选定的卡。将两个全量结果目录放在同一台机器上后合并报告。
 

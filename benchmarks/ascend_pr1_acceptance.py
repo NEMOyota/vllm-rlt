@@ -12,7 +12,7 @@ separately. The ten fixed seeds select the prompt token IDs for both chips.
   cd vllm-rlt
   export MODEL=/models/Ouro-1.4B
   python benchmarks/ascend_pr1_acceptance.py plan --chip 910B4
-  python benchmarks/ascend_pr1_acceptance.py run --chip 910B4 --cases p1024_s8
+  python benchmarks/ascend_pr1_acceptance.py run --chip 910B4 --categories 3 --cases W1,W2,W3,W4,W5
   python benchmarks/ascend_pr1_acceptance.py run --chip 910B4
   python benchmarks/ascend_pr1_acceptance.py report results-910B3 results-910B4
 
@@ -27,13 +27,16 @@ reads missing Git objects from this bundle into a temporary checkout. To test
 another local checkout or bundle, use --repo or --candidate-bundle together
 with --candidate. The report records the full SHA used for inference.
 Select categories with --categories 1,2,4. Report paths are relative to the run.
-For a focused replay use --categories 2 --cases p1024_s8.
+The W1-W5 phase starts each workload after the preceding workload's workers exit
+on all selected cards. Each workload/seed has a fresh process. Within that
+process each replay releases its engine and KV pool outside the measured window.
 Exit codes: 0 selected checks passed, 1 measured failures, 2 incomplete execution.
 """
 
 import argparse
 import asyncio
 import csv
+import gc
 import hashlib
 import json
 import math
@@ -47,6 +50,7 @@ import sys
 import tempfile
 import time
 import traceback
+import weakref
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, closing, contextmanager
@@ -311,6 +315,18 @@ def memory(model, *, reset=False):
         allocated=torch.npu.memory_allocated(device),
         reserved=torch.npu.memory_reserved(device),
     )
+
+
+def release_replay_memory(model):
+    import torch
+
+    device = model.lm_head.weight.device
+    if device.type == "npu":
+        torch.npu.synchronize(device)
+    # StageEngine and PreemptionManager reference one another even after close().
+    gc.collect()
+    if device.type == "npu":
+        torch.npu.empty_cache()
 
 
 def generate(engine, rid, tokens, count):
@@ -643,12 +659,19 @@ def engine_performance(model, job, cfg, folder):
     reference, first_by_arm = {}, {}
     largest = 0
 
-    def replay(arm, *, seconds=None, fixed=None, resource=False):
-        if model.lm_head.weight.device.type == "npu":
-            import torch
+    def replay(arm, phase, round_number, *, seconds=None, fixed=None, resource=False):
+        def record(stage, **extra):
+            entry = dict(phase=phase, round=round_number, arm=arm, stage=stage, pid=os.getpid())
+            with (folder / "replay-memory.jsonl").open("a") as stream:
+                print(json.dumps(dict(entry, **memory(model), **extra)), file=stream)
 
-            torch.npu.empty_cache()
+        record("before_create")
         with closing(new_engine(model, arm != "off", blocks, residents, width)) as engine:
+            pools = (
+                weakref.ref(engine.cache_manager.key_cache),
+                weakref.ref(engine.cache_manager.value_cache),
+            )
+            record("after_create")
             generate(engine, "donor", miss if arm == "miss" else donor, 1)
             engine.model_runner.synchronize()
             before = occupancy(engine.cache_manager)
@@ -684,14 +707,21 @@ def engine_performance(model, job, cfg, folder):
                             controlled=resource,
                         )
                     )
-            return run
+        del engine
+        release_replay_memory(model)
+        released = all(ref() is None for ref in pools)
+        record("after_cleanup", kv_released=released)
+        if not released:
+            raise RuntimeError(f"{phase} round {round_number} {arm}: previous KV pool still live")
+        return run
 
     # Each controlled cohort is freshly primed. No client waits behind another
     # cohort and turns an intended miss into a hit. These also warm each shape.
+    release_replay_memory(model)
     controlled_refs, controlled = {}, []
     for index in range(3):
         for arm in ARMS[index:] + ARMS[:index]:
-            run = replay(arm, fixed=residents, resource=True)
+            run = replay(arm, "controlled", index + 1, fixed=residents, resource=True)
             write(folder / f"controlled-{index + 1}-{arm}.json", run)
             batch = run["requests"].values()
             controlled.append(
@@ -723,7 +753,7 @@ def engine_performance(model, job, cfg, folder):
 
     for index in range(3):
         for arm in ARMS[index:] + ARMS[:index]:
-            run = replay(arm, seconds=cfg["window"])
+            run = replay(arm, "window", index + 1, seconds=cfg["window"])
             rows = run["requests"]
             largest = max(largest, len(rows))
             for rid, row in rows.items():
@@ -753,7 +783,7 @@ def engine_performance(model, job, cfg, folder):
             measurements.append(measures)
             write(folder / f"window-{index + 1}-{arm}.json", run)
     if len(reference) < largest:
-        extra = replay("off", fixed=largest)
+        extra = replay("off", "supplemental", 1, fixed=largest)
         write(folder / "supplemental-off.json", extra)
         for rid, row in extra["requests"].items():
             reference.setdefault(rid, row["tokens"])
@@ -791,7 +821,9 @@ def w3_trace(model, job, folder):
     case = combo.Case(3072, 1024)
     traces = {}
     for arm in ("off", "reuse"):
+        release_replay_memory(model)
         diag.prefill_window(model, case, inputs, arm, nullcontext())
+        release_replay_memory(model)
         path = folder / arm
         path.mkdir()
         result = diag.prefill_window(model, case, inputs, arm, diag.capture_context(path, True))
@@ -1536,12 +1568,16 @@ def stop_worker(pid):
 def run_lane(cfg, tree, precision, jobs):
     root = Path(cfg["out"])
     remaining = list(jobs)
+    first = jobs[0]
+    label = first.kind
+    if first.case in WORKLOADS or first.case == "W3-trace":
+        label = f"{first.case}-seed-{first.seed}"
     attempt = 0
     # Restart after a hard timeout or a device-process crash. Completed jobs
     # survive, the interrupted item stays incomplete, other seeds still run.
     while remaining:
         attempt += 1
-        lane = root / "workers" / f"{precision}-{jobs[0].kind}-{jobs[0].card}-{attempt}.json"
+        lane = root / "workers" / f"{precision}-{label}-{first.card}-{attempt}.json"
         progress = lane.with_suffix(".current.json")
         write(lane, [asdict(j) for j in remaining])
         env = dict(os.environ, PYTHONPATH=str(tree), ASCEND_RT_VISIBLE_DEVICES=str(jobs[0].card))
@@ -1606,19 +1642,22 @@ def run_lane(cfg, tree, precision, jobs):
 
 
 def execute(cfg, tree, precision, jobs):
-    cards = defaultdict(list)
+    phases = defaultdict(lambda: defaultdict(list))
     for job in jobs:
-        cards[job.card].append(job)
+        phase = job.case if job.case in WORKLOADS or job.case == "W3-trace" else job.kind
+        phases[phase][job.card].append(job)
 
-    def per_card(items):
-        # Separate processes keep HTTP children from competing with a loaded model.
-        for kind in ("pytest", "engine", "http"):
-            group = [j for j in items if j.kind == kind]
-            if group:
-                run_lane(cfg, tree, precision, group)
+    def per_card(phase, items):
+        if phase in WORKLOADS:
+            for job in items:
+                run_lane(cfg, tree, precision, [job])
+        else:
+            run_lane(cfg, tree, precision, items)
 
-    with ThreadPoolExecutor(max_workers=max(1, len(cards))) as pool:
-        list(pool.map(per_card, cards.values()))
+    with ThreadPoolExecutor(max_workers=max(1, len({j.card for j in jobs}))) as pool:
+        for phase in ("pytest", "engine", *WORKLOADS, "W3-trace", "http"):
+            # Wait for every worker in this workload to exit before starting the next.
+            list(pool.map(partial(per_card, phase), phases[phase].values()))
 
 
 def failed_jobs(root, jobs):
