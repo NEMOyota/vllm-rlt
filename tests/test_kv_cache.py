@@ -356,3 +356,28 @@ def test_snapshot_refuses_leased_allocations():
     cache.pin_transfer("a", "t")
     with pytest.raises(RuntimeError, match="transfer"):
         cache.snapshot("a")
+
+
+@pytest.mark.parametrize("length, extended_hit", [(127, 112), (128, 128), (129, 128)])
+def test_publish_aligned_tail_for_longer_consumer(length, extended_hit):
+    cache = make_cache(num_blocks=48, block_size=16, max_loops=4, enable_prefix_caching=True)
+    tokens = list(range(length))
+    assert cache.allocate("donor", length)
+    cache.mark_imported_prefix("donor", length)
+    cache.publish_prefix("donor", tokens, length)
+    cache.free("donor")
+    assert len(cache.lookup_prefix(tokens + [999])) * 16 == extended_hit
+    assert len(cache.lookup_prefix(tokens)) * 16 == (length - 1) // 16 * 16
+
+
+def test_aligned_tail_waits_for_every_layer_and_depth():
+    cache = make_cache(enable_prefix_caching=True)
+    tokens = [1, 2]
+    assert cache.allocate("donor", 2)
+    fill_prefix(cache, "donor", [0, 1], depths=[0, 1])
+    fill_prefix(cache, "donor", [0], depths=[2])
+    cache.publish_prefix("donor", tokens, 2)
+    assert not cache.lookup_prefix(tokens + [3])
+    fill_prefix(cache, "donor", [1], depths=[2])
+    cache.publish_prefix("donor", tokens, 2)
+    assert len(cache.lookup_prefix(tokens + [3])) == 1

@@ -413,11 +413,8 @@ class KVCacheManager:
         if event is not None:
             self._pending_prefixes.append((request_id, allocation, tuple(tokens), length, event))
             return
-        # Prefix entries retain KV, not the final hidden state needed by CODA.
-        # Leave at least the last prompt token to recompute on a cache hit;
-        # full-page alignment may leave additional tokens to recompute.
-        publishable_tokens = min(length, len(tokens) - 1)
-        for index, key in enumerate(self._prefix_keys(tokens[:publishable_tokens])):
+        # A longer consumer can reuse even a page ending at the donor boundary.
+        for index, key in enumerate(self._prefix_keys(tokens[:length])):
             if key in self._prefixes:
                 continue
             end = (index + 1) * self.block_size
@@ -435,6 +432,7 @@ class KVCacheManager:
             return ()
         self.poll_prefixes()
         found = []
+        # We cache KV, so the consumer must still compute its final hidden state.
         for key in self._prefix_keys(tokens[:-1]):
             blocks = self._prefixes.get(key)
             if blocks is None:

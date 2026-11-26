@@ -154,3 +154,25 @@ def test_invalid_sampling_does_not_admit_cached_request(ouro_checkpoint):
             assert runtime.stats() == {"requests": 0, "used_blocks": 0}
     finally:
         runtime.close()
+
+
+@pytest.mark.npu
+@torch.inference_mode()
+def test_aligned_donor_tail_on_ascend(ouro_checkpoint):
+    prefix = list(range(10, 138))
+    extended = prefix + list(range(200, 232))
+    results = []
+    for enabled in (False, True):
+        runtime = engine(
+            ouro_checkpoint, cache_config=replace(CACHE, enable_prefix_caching=enabled)
+        )
+        try:
+            generate(runtime, prefix)
+            same, same_hit = generate(runtime, prefix)
+            longer, longer_hit = generate(runtime, extended)
+            assert same_hit == (112 if enabled else 0)
+            assert longer_hit == (128 if enabled else 0)
+            results.append((same, longer))
+        finally:
+            runtime.close()
+    assert results[0] == results[1]
