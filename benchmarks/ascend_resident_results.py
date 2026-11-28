@@ -179,10 +179,34 @@ def compare(a, b, category, issues):
 def report(folder, jobs):
     """Rebuild from raw results, including expected jobs with absent/failed observations."""
     rows, records, issues = [], {}, []
+    stack = None
     for job in jobs:
-        path = folder / job["path"] / "result.json"
+        work = folder / job["path"]
+        path = work / "result.json"
         data = json.loads(path.read_text()) if path.exists() else {"status": "MISSING"}
         ident = {k: job[k] for k in ("case", "order", "group", "round", "seed", "mode", "path")}
+        device_path = work / "device.json"
+        device = json.loads(device_path.read_text()) if device_path.exists() else {}
+        card = device.get("physical_card")
+        planned_card = job.get("physical_card")
+        ident.update(planned_card=planned_card, physical_card=card)
+        status, error = data["status"], data.get("error", "")
+        if status in ("OK", "DIAGNOSTIC") and planned_card is not None:
+            signature = tuple(
+                device.get(k) for k in ("card", "torch", "torch_npu", "cann", "allow_hf32")
+            )
+            if card != planned_card or device.get("process_device") != f"npu:{job['device']}":
+                status, error = (
+                    "DEVICE_MISMATCH",
+                    f"expected card {planned_card}/npu:{job['device']}, got {device}",
+                )
+            elif stack is not None and signature != stack:
+                status, error = (
+                    "DEVICE_MISMATCH",
+                    "hardware model or software differs across workers",
+                )
+            else:
+                stack = signature
         row = {
             **ident,
             **{
@@ -198,14 +222,18 @@ def report(folder, jobs):
             "physical_pool_blocks": data.get("pool", {}).get("blocks"),
             **data.get("metrics", {}),
             **job["theory"],
-            "status": data["status"],
-            "error": data.get("error", ""),
+            "status": status,
+            "error": error,
         }
         rows.append(row)
-        if data.get("request_ids") and set(data["request_ids"]) == set(data.get("outputs", {})):
+        if (
+            status != "DEVICE_MISMATCH"
+            and data.get("request_ids")
+            and set(data["request_ids"]) == set(data.get("outputs", {}))
+        ):
             records[job["path"]] = (row, data)
-        if data["status"] != "OK":
-            issues.append({**ident, "kind": data["status"], "error": row["error"]})
+        if status != "OK":
+            issues.append({**ident, "kind": status, "error": error})
 
     def check(left, right, category):
         a, x = left
@@ -220,8 +248,11 @@ def report(folder, jobs):
                 {
                     **r,
                     "seed": a["seed"],
+                    "mode": a["mode"],
                     "case": a["case"],
                     "order": a["order"],
+                    "left_card": a["physical_card"],
+                    "right_card": b["physical_card"],
                     "left": a["path"],
                     "right": b["path"],
                 }
@@ -230,12 +261,17 @@ def report(folder, jobs):
 
     cohorts, repeats = defaultdict(list), defaultdict(list)
     for row, data in records.values():
-        key = row["case"], row["order"], row["seed"]
+        key = row["case"], row["order"], row["seed"], row["mode"]
         cohorts[key + (row["round"],)].append((row, data))
         repeats[key + (row["group"],)].append((row, data))
     for runs in repeats.values():
-        for later in runs[1:]:
-            check(runs[0], later, "within_group_across_rounds")
+        for left, right in combinations(runs, 2):
+            same_card = left[0]["physical_card"] == right[0]["physical_card"]
+            check(
+                left,
+                right,
+                "within_group_across_rounds" if same_card else "within_group_across_cards",
+            )
     for runs in cohorts.values():
         for left, right in combinations(runs, 2):
             a, b = GROUPS[left[0]["group"]], GROUPS[right[0]["group"]]
@@ -251,23 +287,32 @@ def report(folder, jobs):
     comparisons = []
     rounds = defaultdict(dict)
     for row in rows:
-        rounds[row["case"], row["order"], row["round"]][row["group"]] = row
-    for (case, order, rnd), groups in rounds.items():
+        rounds[row["case"], row["order"], row["seed"], row["round"], row["mode"]][row["group"]] = (
+            row
+        )
+    for (case, order, seed, rnd, mode), groups in rounds.items():
         for numerator, denominator in PAIRS:
             if numerator not in groups or denominator not in groups:
                 continue
             a, b = groups[numerator], groups[denominator]
-            eligible = a["mode"] == "performance" and a["status"] == b["status"] == "OK"
+            same_card = a["physical_card"] == b["physical_card"]
+            eligible = (
+                same_card and a["mode"] == "performance" and a["status"] == b["status"] == "OK"
+            )
             for metric in METRICS:
                 x, y = a.get(metric), b.get(metric)
-                pct = 100 * (x / y - 1) if x is not None and y else None
+                pct = 100 * (x / y - 1) if same_card and x is not None and y else None
                 comparisons.append(
                     dict(
                         case=case,
                         order=order,
+                        mode=mode,
                         round=rnd,
                         pair=f"{numerator}/{denominator}",
                         metric=metric,
+                        seed=seed,
+                        numerator_card=a["physical_card"],
+                        denominator_card=b["physical_card"],
                         numerator=x,
                         denominator=y,
                         change_pct=pct,
@@ -279,14 +324,17 @@ def report(folder, jobs):
     aggregate = []
     by_pair = defaultdict(list)
     for item in comparisons:
-        by_pair[item["case"], item["order"], item["pair"], item["metric"]].append(item)
-    for (case, order, pair, metric), items in by_pair.items():
+        by_pair[item["case"], item["order"], item["mode"], item["pair"], item["metric"]].append(
+            item
+        )
+    for (case, order, mode, pair, metric), items in by_pair.items():
         values = [x["change_pct"] for x in items if x["eligible"] and x["change_pct"] is not None]
         aggregate.append(
             dict(
                 case=case,
                 order=order,
                 pair=pair,
+                mode=mode,
                 metric=metric,
                 n=len(values),
                 planned=len(items),
@@ -298,8 +346,8 @@ def report(folder, jobs):
     arm_rows = []
     by_arm = defaultdict(list)
     for r in rows:
-        by_arm[r["case"], r["order"], r["group"]].append(r)
-    for (case, order, group), runs in by_arm.items():
+        by_arm[r["case"], r["order"], r["mode"], r["group"]].append(r)
+    for (case, order, mode, group), runs in by_arm.items():
         for metric in METRICS:
             values = [
                 r[metric]
@@ -311,6 +359,7 @@ def report(folder, jobs):
                     case=case,
                     order=order,
                     group=group,
+                    mode=mode,
                     metric=metric,
                     valid=len(values),
                     planned=len(runs),
@@ -330,9 +379,9 @@ def report(folder, jobs):
         "Theoretical limits assume retained, full prefix hits. Times are host-visible. "
         "Only complete, output-matched performance pairs enter the aggregates.",
         "",
-        "|Case/order|Group/round|Theory peak|Measured peak|Output tok/s|Queue P95 ms|"
-        "TTFT P95 ms|Decode mean batch|Peak allocated GiB|Status|",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---|",
+        "|Case/order|Mode/group/round|Card (observed)|Theory peak|Measured peak|Output tok/s|"
+        "Queue P95 ms|TTFT P95 ms|Decode mean batch|Peak allocated GiB|Status|",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
 
     def cell(x):
@@ -351,7 +400,8 @@ def report(folder, jobs):
             )
         ]
         lines.append(
-            f"|{r['case']}/{r['order']}|{r['group']}/{r['round']}|{r['theory_peak']}|"
+            f"|{r['case']}/{r['order']}|{r['mode']}/{r['group']}/{r['round']}|"
+            f"{r['physical_card'] or '—'}|{r['theory_peak']}|"
             + "|".join(metrics)
             + f"|{cell(gib / 2**30 if gib is not None else None)}|{r['status']}|"
         )
@@ -363,7 +413,7 @@ def report(folder, jobs):
         ]
     )
     for r in aggregate:
-        if r["metric"] == "output_tok_s":
+        if r["mode"] == "performance" and r["metric"] == "output_tok_s":
             lines.append(
                 f"|{r['case']}/{r['order']}|{r['pair']}|{r['n']}/{r['planned']}|"
                 + "|".join(cell(r[k]) for k in ("median_pct", "min_pct", "max_pct"))

@@ -1,11 +1,13 @@
+import asyncio
 import csv
 import json
+import os
 from dataclasses import replace
 
 import pytest
 import torch
 
-from benchmarks.ascend_prefix_resident_capacity import parser, plan, run_child, target
+from benchmarks.ascend_prefix_resident_capacity import main, parser, plan, run_child, target
 from benchmarks.ascend_resident_observer import audit_pages
 from benchmarks.ascend_resident_results import GROUPS, Config, fixture, report, write_json
 from tests.helpers import tiny_ouro_config
@@ -170,6 +172,18 @@ def make_results(tmp_path, planned):
         d = tmp_path / j["path"]
         d.mkdir(parents=True)
         write_json(
+            d / "device.json",
+            dict(
+                physical_card=j["physical_card"],
+                process_device=f"npu:{j['device']}",
+                card="test",
+                torch="test",
+                cann="test",
+                torch_npu="test",
+                allow_hf32=False,
+            ),
+        )
+        write_json(
             d / "result.json",
             dict(
                 status="OK",
@@ -183,7 +197,7 @@ def make_results(tmp_path, planned):
 
 @pytest.mark.parametrize("mode", ["performance", "audit", "profile"])
 def test_pairing_excludes_diagnostic_missing_and_nonperformance(tmp_path, mode):
-    planned = jobs("--rounds", "3", "--groups", "A", "B", "--mode", mode)
+    planned = jobs("--device", "0", "--rounds", "3", "--groups", "A", "B", "--mode", mode)
     make_results(tmp_path, planned)
     fail = tmp_path / planned[-1]["path"] / "result.json"
     fail.unlink()
@@ -208,24 +222,26 @@ def test_pairing_excludes_diagnostic_missing_and_nonperformance(tmp_path, mode):
 
 
 def test_failed_worker_and_timeout_are_recorded(tmp_path, monkeypatch):
-    from subprocess import TimeoutExpired
-
     job = tmp_path / "job.json"
     write_json(job, {"mode": "performance"})
+    killed = []
 
     class Child:
         pid = 200
+        returncode = None
 
-        def poll(self):
+        async def wait(self):
+            if not killed:
+                await asyncio.sleep(60)
             return 0
 
-        def wait(self, timeout=None):
-            if timeout:
-                raise TimeoutExpired("worker", timeout)
-            return 0
+    async def launch(*args, **kwargs):
+        return Child()
 
-    monkeypatch.setattr("subprocess.Popen", lambda *a, **kw: Child())
-    run_child(tmp_path, job, 1)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", launch)
+    monkeypatch.setattr(os, "killpg", lambda pid, sig: killed.append(pid))
+    asyncio.run(run_child(tmp_path, job, 0))
+    assert killed == [200]
     assert json.loads((tmp_path / "result.json").read_text())["status"] == "TIMEOUT"
 
 
@@ -321,3 +337,158 @@ def test_operator_audit_counts_dispatched_shapes_without_replacing_results():
             is q
         )
     assert counts == {("sdpa", (1, 1, 1), (7, 7, 7)): 1, ("fia", (2, 5), (9, 5)): 1}
+
+
+def test_round_card_placement_preserves_global_counterbalancing(monkeypatch):
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "5,2,7,3")
+    opts = ("--rounds", "5", "--case", "mixed", "--groups", "B", "C", "I")
+    many = jobs("--cards", "2,5", *opts)
+    one = jobs("--device", "1", *opts)
+    assert [(j["round"], j["order"], j["group"]) for j in many] == [
+        (j["round"], j["order"], j["group"]) for j in one
+    ]
+    assert all(
+        j["physical_card"] == ("2" if j["round"] % 2 else "5")
+        and j["device"] == 0
+        and j["visible_devices"] == j["physical_card"]
+        for j in many
+    )
+    assert all(
+        j["physical_card"] == "2" and j["device"] == 1 and j["visible_devices"] == "5,2,7,3"
+        for j in one
+    )
+    assert [j["physical_card"] for j in jobs("--rounds", "5", "--groups", "A")] == [
+        "5",
+        "2",
+        "7",
+        "3",
+        "5",
+    ]
+    with pytest.raises(ValueError, match="visible"):
+        jobs("--cards", "0,1")
+    with pytest.raises(ValueError, match="dedicated"):
+        jobs("--cards", "2,5", "--audit-cards", "5,7")
+
+
+def test_eight_card_plan_and_aggregation_keep_audits_separate(tmp_path, monkeypatch):
+    monkeypatch.delenv("ASCEND_RT_VISIBLE_DEVICES", raising=False)
+    planned = jobs("--audit-cards", "6,7")
+    assert len(planned) == 27
+    assert [j["physical_card"] for j in planned[:24:4]] == list("012345")
+    assert [(j["physical_card"], j["group"], j["case"]) for j in planned[24:]] == [
+        ("6", "C", "hot"),
+        ("6", "I", "hot"),
+        ("7", "I", "evict"),
+    ]
+    make_results(tmp_path, planned)
+    rows = report(tmp_path, planned)
+    assert all(r["status"] == "OK" for r in rows)
+    summary = list(csv.DictReader((tmp_path / "paired_summary.csv").open()))
+    assert {
+        (x["pair"], x["n"], x["planned"])
+        for x in summary
+        if x["mode"] == "performance" and x["metric"] == "output_tok_s"
+    } == {(p, "6", "6") for p in ("I/C", "I/B", "B/A", "C/A")}
+    assert {x["n"] for x in summary if x["mode"] == "audit"} == {"0"}
+    bad = tmp_path / planned[0]["path"] / "device.json"
+    device = json.loads(bad.read_text())
+    write_json(bad, device | {"physical_card": "4"})
+    rows = report(tmp_path, planned)
+    assert rows[0]["status"] == "DEVICE_MISMATCH"
+    pairs = list(csv.DictReader((tmp_path / "paired_rounds.csv").open()))
+    broken = next(
+        x
+        for x in pairs
+        if x["round"] == "1" and x["pair"] == "B/A" and x["metric"] == "output_tok_s"
+    )
+    assert broken["eligible"] == "False" and broken["change_pct"] == ""
+
+
+def test_cross_card_drift_is_distinguished_from_same_card_repeats(tmp_path, monkeypatch):
+    monkeypatch.delenv("ASCEND_RT_VISIBLE_DEVICES", raising=False)
+    planned = jobs("--cards", "5,7", "--groups", "B", "--rounds", "4")
+    make_results(tmp_path, planned)
+    for j in planned:
+        if j["physical_card"] == "7":
+            path = tmp_path / j["path"] / "result.json"
+            write_json(
+                path, json.loads(path.read_text()) | {"outputs": {"r": [7, 10 + j["round"]]}}
+            )
+    report(tmp_path, planned)
+    issues = [json.loads(x) for x in (tmp_path / "exceptions.jsonl").read_text().splitlines()]
+    assert {(r["comparison"], r["left_card"], r["right_card"]) for r in issues} == {
+        ("within_group_across_cards", "5", "7"),
+        ("within_group_across_cards", "7", "5"),
+        ("within_group_across_rounds", "7", "7"),
+    }
+
+
+def test_parallel_launcher_runs_real_isolated_processes(tmp_path, monkeypatch):
+    # A filesystem barrier on the first arm of each lane makes actual overlap necessary.
+    stub = tmp_path / "stub_arm.py"
+    stub.write_text("""
+import json, os, sys, time
+from pathlib import Path
+spec=Path(sys.argv[-1])
+j=json.loads(spec.read_text())
+card=os.environ['ASCEND_RT_VISIBLE_DEVICES']
+stamp=time.monotonic_ns()
+if j['round'] in (1,2) and j['group']==('A' if j['round']==1 else 'B'):
+    root=Path(os.environ['BARRIER_DIR'])
+    (root / ('ready-'+card)).touch()
+    for _ in range(200):
+        if len(list(root.glob('ready-*')))==2:
+            break
+        time.sleep(0.01)
+    else:
+        raise RuntimeError('other round did not run in parallel')
+d=spec.parent
+(d/'device.json').write_text(json.dumps(dict(card='stub',physical_card=card,process_device='npu:0',
+                                   torch='stub',torch_npu='stub',cann='stub',allow_hf32=False)))
+oom=j['round']==2 and j['group']=='B'
+(d/'result.json').write_text(json.dumps(dict(status='OOM' if oom else 'OK',
+    metrics={'output_tok_s':1},
+    request_ids=['r'],outputs={'r':[1]},input_sha256='fixed',start=stamp,end=time.monotonic_ns())))
+sys.exit(int(oom))
+""")
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "3,5")
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path) + os.pathsep + os.getenv("PYTHONPATH", ""))
+    monkeypatch.setenv("BARRIER_DIR", str(tmp_path))
+    monkeypatch.setattr("benchmarks.ascend_prefix_resident_capacity.MODULE", "stub_arm")
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text("{}")
+    (model / "model.safetensors").write_bytes(b"fixture")
+    out = tmp_path / "out"
+    assert (
+        main(
+            [
+                "--cards",
+                "3,5",
+                "--rounds",
+                "3",
+                "--groups",
+                "A",
+                "B",
+                "--checkpoint",
+                str(model),
+                "--output",
+                str(out),
+            ]
+        )
+        == 1
+    )
+    data = json.loads((out / "config.json").read_text())
+    by_card = {}
+    for j in data["jobs"]:
+        r = json.loads((out / j["path"] / "result.json").read_text())
+        seq = by_card.setdefault(j["physical_card"], [])
+        assert not seq or seq[-1]["end"] <= r["start"]
+        seq.append(r)
+    assert len(by_card["3"]) == 4 and len(by_card["5"]) == 2
+    assert by_card["5"][0]["status"] == "OOM" and by_card["5"][1]["status"] == "OK"
+    assert max(seq[0]["start"] for seq in by_card.values()) < min(
+        seq[0]["end"] for seq in by_card.values()
+    )
+    assert set(json.loads((out / "environment.json").read_text())["devices"]) == {"3", "5"}
+    assert os.environ["ASCEND_RT_VISIBLE_DEVICES"] == "3,5"

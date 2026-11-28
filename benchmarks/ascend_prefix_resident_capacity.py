@@ -1,6 +1,7 @@
-"""Measure fixed-pool W4 residency on one Ascend device, with paired independent arms."""
+"""Measure fixed-pool W4 residency with round-parallel Ascend devices and same-card paired arms."""
 
 import argparse
+import asyncio
 import hashlib
 import json
 import os
@@ -8,7 +9,7 @@ import signal
 import subprocess
 import sys
 import traceback
-from collections import Counter
+from collections import Counter, defaultdict
 from contextlib import ExitStack
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -16,6 +17,7 @@ from statistics import mean
 
 import torch
 
+from benchmarks.ascend_paged_prefill_probe import devices_arg
 from benchmarks.ascend_prefix_benefit import Workload, workload_inputs
 from benchmarks.ascend_resident_observer import Observer, dump_lines, residency
 from benchmarks.ascend_resident_results import (
@@ -46,7 +48,20 @@ def parser():
     p.add_argument("--mode", choices=("performance", "audit", "profile"), default="performance")
     p.add_argument("--seed", type=int, default=797543261)
     p.add_argument("--rounds", type=int, default=6)
-    p.add_argument("--device", type=int, default=0, help="process-local NPU index")
+    placement = p.add_mutually_exclusive_group()
+    placement.add_argument("--device", type=int, help="run all rounds on one process-local NPU")
+    placement.add_argument(
+        "--cards",
+        type=devices_arg,
+        metavar="0,1,...",
+        help="physical NPUs for round-robin placement of complete rounds",
+    )
+    p.add_argument(
+        "--audit-cards",
+        type=devices_arg,
+        metavar="6,7",
+        help="also run hot C/I and forced eviction I audits once, on two reserved cards",
+    )
     p.add_argument("--checkpoint", type=Path)
     p.add_argument("--output", type=Path, help="new run directory")
     p.add_argument("--timeout-s", type=int, default=7200, help="wall limit per isolated arm")
@@ -60,8 +75,24 @@ def parser():
 def plan(args):
     cfg = Config(**{k: getattr(args, k) for k in asdict(Config())})
     cfg.validate()
-    if args.rounds < 1 or args.timeout_s < 1 or args.device < 0:
-        raise ValueError("rounds and timeout must be positive; device must be nonnegative")
+    mask = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
+    visible = devices_arg(mask) if mask else None
+    if args.device is not None:
+        if args.device < 0 or (visible and args.device >= len(visible)):
+            raise ValueError("--device is outside the process-visible devices")
+        cards = [visible[args.device] if visible else args.device]
+        worker_device = args.device
+    else:
+        cards = args.cards or [
+            c for c in (visible or range(8)) if c not in (args.audit_cards or [])
+        ]
+        if not cards:
+            raise ValueError("no cards available for performance rounds")
+        if visible and not set(cards).issubset(visible):
+            raise ValueError(f"--cards must be visible in ASCEND_RT_VISIBLE_DEVICES={mask}")
+        worker_device = 0
+    if args.rounds < 1 or args.timeout_s < 1:
+        raise ValueError("rounds and timeout must be positive")
     groups = (
         args.groups
         or {"hot": list("ABCI"), "cold": list("CI"), "mixed": list("CBI"), "evict": ["I"]}[
@@ -86,6 +117,7 @@ def plan(args):
             # Adjacent rounds reverse the order; rotate each subsequent pair.
             offset = (i // 2) % len(groups)
             sequence = groups[offset:] + groups[:offset]
+            card = str(cards[i % len(cards)])
             for g in sequence[::-1] if i % 2 else sequence:
                 path = f"{args.mode}/{args.case}-{arrival}/seed-{args.seed}/round-{i + 1:02d}/{g}"
                 jobs.append(
@@ -93,6 +125,9 @@ def plan(args):
                         case=args.case,
                         order=arrival,
                         group=g,
+                        physical_card=card,
+                        device=worker_device,
+                        visible_devices=mask if args.device is not None else card,
                         round=i + 1,
                         seed=args.seed,
                         mode=args.mode,
@@ -102,6 +137,34 @@ def plan(args):
                         theory=cfg.theory(g, n_hot),
                     )
                 )
+    if args.audit_cards is not None:
+        if (
+            args.mode != "performance"
+            or len(args.audit_cards) != 2
+            or set(cards).intersection(args.audit_cards)
+        ):
+            raise ValueError(
+                "--audit-cards requires two dedicated cards outside the performance list"
+            )
+        for card, case, audit_groups in zip(
+            args.audit_cards, ("hot", "evict"), (["C", "I"], ["I"]), strict=True
+        ):
+            audit_args = argparse.Namespace(
+                **(
+                    vars(args)
+                    | dict(
+                        case=case,
+                        mode="audit",
+                        groups=audit_groups,
+                        order=None,
+                        rounds=1,
+                        audit_cards=None,
+                        cards=[card],
+                        device=None,
+                    )
+                )
+            )
+            jobs.extend(plan(audit_args)[1])
     return cfg, jobs
 
 
@@ -366,11 +429,12 @@ def worker(path):
         torch.npu.set_device(device)
         torch.npu.matmul.allow_hf32 = False
         visible = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
-        physical = visible.split(",")[job["device"]].strip() if visible else str(job["device"])
+        local_id = torch.npu.current_device()
+        physical = visible.split(",")[local_id].strip() if visible else str(local_id)
         env = dict(
             card=torch.npu.get_device_name(job["device"]),
             physical_card=physical,
-            process_device=str(device),
+            process_device=f"npu:{local_id}",
             visible=visible,
             torch=str(torch.__version__),
             torch_npu=str(torch_npu.__version__),
@@ -449,9 +513,10 @@ def worker(path):
     return 0 if record["status"] == "OK" else 1
 
 
-def run_child(work, spec, timeout):
+async def run_child(work, spec, timeout):
     cmd = [sys.executable, "-m", MODULE, "--worker", str(spec)]
-    if json.loads(spec.read_text())["mode"] == "profile":
+    job = json.loads(spec.read_text())
+    if job["mode"] == "profile":
         cmd = [
             "msprof",
             f"--output={work / 'profiles'}",
@@ -464,15 +529,26 @@ def run_child(work, spec, timeout):
     result = work / "result.json"
     try:
         with (work / "run.log").open("w") as log:
-            process = subprocess.Popen(
-                cmd, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
+            env = os.environ.copy()
+            if job.get("visible_devices") is not None:
+                env["ASCEND_RT_VISIBLE_DEVICES"] = job["visible_devices"]
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=ROOT,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                env=env,
+                start_new_session=True,
             )
             try:
-                code = process.wait(timeout=timeout)
+                code = await asyncio.wait_for(process.wait(), timeout)
             except BaseException:
-                if process.poll() is None:
-                    os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
+                if process.returncode is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                await process.wait()
                 raise
         data = json.loads(result.read_text()) if result.exists() else {}
         if data.get("status") not in ("ERROR", "OOM", "DIAGNOSTIC") and (
@@ -485,13 +561,59 @@ def run_child(work, spec, timeout):
             and not any((work / "profiles").rglob("PROF_*"))
         ):
             raise RuntimeError("msprof completed without a PROF_* capture")
-    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+    except asyncio.CancelledError:
+        data = json.loads(result.read_text()) if result.exists() else {}
+        write_json(result, data | {"status": "CANCELLED", "error": "launcher interrupted"})
+        raise
+    except (OSError, RuntimeError, asyncio.TimeoutError) as exc:
         data = json.loads(result.read_text()) if result.exists() else {}
         data.update(
-            status="TIMEOUT" if isinstance(exc, subprocess.TimeoutExpired) else "ERROR",
-            error=repr(exc),
+            status="TIMEOUT" if isinstance(exc, asyncio.TimeoutError) else "ERROR",
+            error=f"exceeded {timeout}s" if isinstance(exc, asyncio.TimeoutError) else repr(exc),
         )
         write_json(result, data)
+
+
+async def run_cards(folder, jobs, timeout, env):
+    # One serial queue per physical device. Only this parent writes the shared reports.
+    lanes = defaultdict(list)
+    for job in jobs:
+        lanes[job["physical_card"]].append(job)
+    env["devices"] = {}
+    write_json(folder / "environment.json", env)
+
+    async def run_lane(card, lane):
+        for j in lane:
+            work = folder / j["path"]
+            work.mkdir(parents=True)
+            spec = work / "job.json"
+            write_json(spec, j)
+            print(f"[card {card}] start {j['path']}", flush=True)
+            await run_child(work, spec, timeout)
+            if (work / "device.json").exists():
+                device = json.loads((work / "device.json").read_text())
+                env["devices"].setdefault(device["physical_card"], device)
+                if len(lanes) == 1:
+                    env["device"] = device
+                write_json(folder / "environment.json", env)
+            rows = report(folder, jobs)
+            status = next(r["status"] for r in rows if r["path"] == j["path"])
+            print(f"[card {card}] {status} {j['path']}", flush=True)
+
+    loop = asyncio.get_running_loop()
+    previous_term = signal.getsignal(signal.SIGTERM)
+    loop.add_signal_handler(signal.SIGTERM, asyncio.current_task().cancel)
+    tasks = [asyncio.create_task(run_lane(card, lane)) for card, lane in lanes.items()]
+    try:
+        await asyncio.gather(*tasks)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        loop.remove_signal_handler(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, previous_term)
+        rows = report(folder, jobs)
+    return rows
 
 
 def main(argv=None):
@@ -501,7 +623,7 @@ def main(argv=None):
         return worker(args.worker)
     try:
         cfg, jobs = plan(args)
-    except ValueError as exc:
+    except (ValueError, argparse.ArgumentTypeError) as exc:
         p.error(str(exc))
     if args.plan:
         print(json.dumps(jobs, indent=2))
@@ -512,7 +634,7 @@ def main(argv=None):
     folder.mkdir(parents=True, exist_ok=False)
     checkpoint = args.checkpoint.resolve()
     for j in jobs:
-        j.update(checkpoint=str(checkpoint), device=args.device)
+        j["checkpoint"] = str(checkpoint)
     write_json(
         folder / "config.json",
         dict(
@@ -529,23 +651,7 @@ def main(argv=None):
         checkpoint=str(checkpoint),
         files_sha256=fingerprint(checkpoint),
     )
-    write_json(folder / "environment.json", env)
-    for i, j in enumerate(jobs):
-        work = folder / j["path"]
-        work.mkdir(parents=True)
-        spec = work / "job.json"
-        write_json(spec, j)
-        print(f"[{i + 1}/{len(jobs)}] {j['path']}", flush=True)
-        run_child(work, spec, args.timeout_s)
-        if (work / "device.json").exists():
-            device = json.loads((work / "device.json").read_text())
-            if env.get("device", device) != device:
-                raise RuntimeError("hardware/software changed between matched arms")
-            if "device" not in env:
-                env["device"] = device
-                write_json(folder / "environment.json", env)
-        rows = report(folder, jobs)
-        print(next(row["status"] for row in rows if row["path"] == j["path"]), flush=True)
+    rows = asyncio.run(run_cards(folder, jobs, args.timeout_s, env))
     return int(any(r["status"] != "OK" for r in rows))
 
 
