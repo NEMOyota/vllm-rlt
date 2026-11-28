@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Use Torch SDPA on Ascend with the runtime's paged KV cache."""
+"""Ascend SDPA and packed TND attention over the runtime's paged KV cache."""
 
 import weakref
 from collections import OrderedDict
+from itertools import accumulate
 
 import torch
 from torch.nn import functional as F
@@ -84,6 +85,7 @@ class AscendAttention:
         self._layout_bytes = 0
         self._layout_limit = 64 * 1024 * 1024
         self.layout_reuses = 0
+        self.sdpa_calls = 0
         self.batched_prefill_calls = 0
         self.ragged_calls = 0
         self.fallback_calls = 0
@@ -158,6 +160,7 @@ class AscendAttention:
         # the result on every layer.
         query = q if len(q) == rows else q[:rows]
         query = query.reshape(rows, q.shape[1], 1, head_dim)
+        self.sdpa_calls += 1
         output = _attend(query, key.transpose(1, 2), value.transpose(1, 2), mask).squeeze(2)
         if len(q) == rows:
             return output
@@ -191,6 +194,7 @@ class AscendAttention:
         if result is None:
             result = torch.zeros_like(q)
         block_size = keys.shape[-3]
+        self.sdpa_calls += len(groups)
         for table_row, indices, positions, mask, initial, _lengths in groups:
             blocks = tables[table_row, positions // block_size]
             offsets = positions % block_size
@@ -233,6 +237,7 @@ class AscendAttention:
             .transpose(1, 2)
         )
         query = q.reshape(size, width, q.shape[1], head_dim).transpose(1, 2)
+        self.sdpa_calls += 1
         return _attend(query, key, value, is_causal=True).transpose(1, 2).reshape_as(q)
 
     def _ragged_decode(self, q, keys, values, tables, groups, flat_rows, result):
@@ -264,6 +269,7 @@ class AscendAttention:
             rows, maximum, kv_heads, head_dim
         )
         query = q.index_select(0, indices).reshape(rows, q.shape[1], 1, head_dim)
+        self.sdpa_calls += 1
         output = _attend(query, key.transpose(1, 2), value.transpose(1, 2), mask).squeeze(2)
         result.index_copy_(0, indices, output)
         return result
@@ -330,3 +336,84 @@ class AscendAttention:
                 q, keys, values, batch.block_tables, ragged, flat_rows, result
             )
         return result
+
+
+class AscendPagedPrefill:
+    """Run one paged TND attention for a mixed or nonzero-start prefill batch."""
+
+    def __init__(self, fused_attention):
+        self.fused_attention = fused_attention
+        self.calls = 0
+        self.plans = 0
+        self._batch = None
+        self._stream = None
+        self._mask = None
+        self._page_bases = None
+
+    def __call__(self, q, keys, values, layer, batch):
+        ranges = batch.packed_ranges
+        if (
+            not ranges
+            or len(ranges) < 2
+            or batch.max_seqlen_q <= 1
+            or len(q) != len(batch.rows)
+            or batch.cu_seqlens_q is None
+            or keys.shape[2:] != (16, 16, 128)
+            or q.shape[1:] != (16, 128)
+            or not keys.is_contiguous()
+            or not values.is_contiguous()
+            or q.dtype != torch.bfloat16
+        ):
+            return None
+
+        # Host ranges and the device table describe the same validated traversal.
+        # Read the host lengths to avoid synchronizing the NPU on every layer.
+        stream = (q.device, AscendAttention._stream_key(q.device))
+        if stream != self._stream:
+            self._stream = stream
+            self._batch = None
+            self._mask = None
+        layers = keys.size(1)
+        if self._batch is None or self._batch() is not batch:
+            self._batch = None
+            self._page_bases = None
+            if not all(seq.start == 0 and seq.end == ranges[0].end for seq in ranges):
+                if self._mask is None:
+                    # CANN sparse_mode=3 takes a compressed right-aligned causal mask.
+                    # Build once on CPU, then upload the same format as the hardware probe.
+                    self._mask = (
+                        torch.ones(2048, 2048, dtype=torch.bool, device="cpu").triu_(1).to(q.device)
+                    )
+                self._q_ends = list(accumulate(seq.end - seq.start for seq in ranges))
+                self._kv_lengths = [seq.end for seq in ranges]
+                table = batch.block_tables
+                # Fill padding with a valid page of the same sequence; actual lengths
+                # determine visibility. Factor out the layer-independent page stride.
+                self._page_bases = torch.where(table < 0, table[:, :1], table) * layers
+                self.plans += 1
+            self._batch = weakref.ref(batch)
+        if self._page_bases is None:
+            return None
+
+        # Pool order is [block, model layer, token, KV head, channel]. A view and
+        # the mapped page IDs avoid gathering or making a layer slice contiguous.
+        key = keys.view(-1, 16, 16 * 128)
+        value = values.view_as(key)
+        output, _ = self.fused_attention(
+            q.contiguous(),
+            key,
+            value,
+            input_layout="TND",
+            block_size=16,
+            block_table=self._page_bases + layer,
+            actual_seq_lengths=self._q_ends,
+            actual_seq_lengths_kv=self._kv_lengths,
+            num_heads=16,
+            num_key_value_heads=16,
+            scale=128**-0.5,
+            sparse_mode=3,
+            inner_precise=0,
+            atten_mask=self._mask,
+        )
+        self.calls += 1
+        return output

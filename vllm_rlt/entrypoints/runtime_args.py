@@ -30,6 +30,11 @@ def add_runtime_args(parser):
     parser.add_argument("--kv-watermark", type=float, default=0.0)
     parser.add_argument("--scheduling-policy", choices=["fcfs", "priority"], default="fcfs")
     parser.add_argument("--enable-preemption", action="store_true")
+    parser.add_argument(
+        "--ascend-paged-prefill",
+        action="store_true",
+        help="Use fused TND attention for packed Ouro prefill on Ascend with 16-token KV pages",
+    )
     packed_prefill_mode = parser.add_mutually_exclusive_group()
     packed_prefill_mode.add_argument(
         "--packed-prefill",
@@ -159,6 +164,7 @@ def runtime_configs(args):
         ),
         execution_config=ExecutionConfig(
             packed_prefill=args.packed_prefill,
+            ascend_paged_prefill=args.ascend_paged_prefill,
             use_uva=args.use_uva,
             cuda_graphs=args.cuda_graphs,
             cuda_graph_warmup=args.cuda_graph_warmup,

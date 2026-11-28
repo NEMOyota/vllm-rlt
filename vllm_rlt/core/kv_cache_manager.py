@@ -1049,6 +1049,11 @@ class KVCacheManager:
         if batch.packed_ranges is not None:
             for seq in batch.packed_ranges:
                 self._require_prefix(seq.allocation, layer, seq.depth, seq.end)
+            packed_kernel = getattr(self.attention, "packed_pool_prefill", None)
+            if packed_kernel is not None and window is None:
+                output = packed_kernel(q, self.key_cache, self.value_cache, layer, batch)
+                if output is not None:
+                    return output
         elif coverage is None:
             for allocation, depth, position in batch.rows:
                 self._require_prefix(allocation, layer, depth, position + 1)

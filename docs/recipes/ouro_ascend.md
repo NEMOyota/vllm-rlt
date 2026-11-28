@@ -204,3 +204,83 @@ VLLM_RLT_OURO_CHECKPOINT="$MODEL" python -m pytest -q --run-npu \
 
 For broader evaluation, see [accuracy](../accuracy.md) and
 [serving benchmarks](../serving.md).
+
+## Experimental 16-token paged prefill
+
+Add `--ascend-paged-prefill` to the synchronous prefix-cache serving command above
+to opt in on Ouro-1.4B. When a packed prefill batch has multiple requests and at
+least one multi-token query, cold requests of different lengths and requests
+with cached prefixes can share one TND fused attention call per model layer and
+loop. Equal-length cold prompts use the existing batched SDPA path. Single
+requests and all-one-token batches also use the existing backend.
+
+For example, for one 128-token hit in a batch of four 144-token prompts, TND
+takes 448 query rows with cumulative ends `[16, 160, 304, 448]` and KV lengths
+`[144, 144, 144, 144]`. Each request reads its own table at its current
+recurrence depth. Right-aligned causal masking lets the first suffix row see
+the 128 cached tokens and itself. A 16-token page is the allocation unit.
+A request can attend to its entire causal history across many pages.
+
+The fused path follows the Q-boundary and page-table convention of
+[vLLM-Ascend's cache-hit attention](https://github.com/vllm-project/vllm-ascend/blob/4098f7a51440bc4e3384cf5a1ff0fc7eba4067a4/vllm_ascend/attention/attention_v1.py#L903-L909).
+RLT stores each K and V pool as `[block, layer, token, head, channel]`. A view
+exposes the original pool storage and page `block * num_layers + layer`
+selects the required layer. The cache manager validates ownership and the
+continuous written prefix before dispatch.
+
+### Run on 910B3 and 910B4
+
+With the original CANN 9.0.0 environment active, run the following from this
+checkout on each machine. Set `MODEL` to the local Ouro-1.4B checkpoint.
+
+```bash
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+ASCEND_RT_VISIBLE_DEVICES=0 python -m pytest --run-npu -m npu -q \
+  tests/test_ascend_varlen_prefill.py
+
+ASCEND_RT_VISIBLE_DEVICES=0 python -m benchmarks.ascend_varlen_prefill \
+  --checkpoint "$MODEL" --cases c4_h1 mixed --rounds 1 --with-cache-off \
+  --output results/varlen-smoke.json
+```
+
+For an eight-card sweep, run one scenario per card. Each comparison stays on
+one physical card, mapped to process-local `npu:0`. Run inside Bash.
+
+```bash
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+cases=(c4_h1 mixed cold_ragged one_token_suffix w2_shape cold_uniform single long_suffix)
+mkdir -p results/varlen
+pids=()
+for i in "${!cases[@]}"; do
+  ASCEND_RT_VISIBLE_DEVICES="$i" python -m benchmarks.ascend_varlen_prefill \
+    --checkpoint "$MODEL" --cases "${cases[i]}" --rounds 3 --max-tokens 16 \
+    --seed 797543261 --with-cache-off --output "results/varlen/${cases[i]}.json" \
+    >"results/varlen/${cases[i]}.log" 2>&1 &
+  pids+=("$!")
+done
+status=0
+for i in "${!pids[@]}"; do
+  wait "${pids[i]}" || { echo "Review ${cases[i]} on card $i"; status=1; }
+done
+test "$status" -eq 0
+```
+
+`legacy` and `paged` both enable prefix caching. They differ only in the
+attention routing switch. The optional `off` arm disables both features.
+Each arm builds a fresh engine, warms it with disjoint inputs, primes the same
+donor prompts, and times the target batch through final token delivery.
+Arm order rotates across rounds. Warmup, donor generation and model loading
+are excluded. `w2_shape` uses 32 prompts of 128 tokens with 96-token hits;
+the default generates 16 tokens per request in one burst. The W2 throughput
+table above uses a 60-second closed-loop workload and 128 output tokens.
+
+Read `prefill_batches`, `hits`, `prefill_sdpa_calls` and `fia_calls` first.
+The counts refer to framework attention API calls. In the one-hot/three-cold
+case, a single target batch on a 24-layer, four-loop model should give
+384 legacy SDPA calls and 96 paged FIA calls. Compare the paired TTFT P50
+saving in milliseconds and the percentage change in output tokens/s across
+rounds. TPOT P50, per-arm output IDs and the first mismatch per request are
+also recorded. A positive TTFT saving means a shorter wait for the first token.
+A positive throughput change means more output tokens delivered per second.
+A mismatch or a dispatch/hit-count failure gives a nonzero exit after saving
+the results. Errors during execution identify the interrupted arm in the JSON.

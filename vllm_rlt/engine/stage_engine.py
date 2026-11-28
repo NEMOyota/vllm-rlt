@@ -141,6 +141,23 @@ class StageEngine:
             speculative=speculative_config is not None,
             preemption=scheduler_config.enable_preemption,
         )
+        if self.execution_config.ascend_paged_prefill and (
+            parameter.device.type != "npu"
+            or attention_backend != "ascend_eager"
+            or not prefer_packed
+            or staged_prefill
+            or sliding_window
+            or self.execution_config.async_scheduling
+            or self.execution_config.multi_stream
+            or self.execution_config.static_buffers
+            or cache_config.block_size != 16
+            or (config.num_attention_heads, config.num_key_value_heads, config.head_dim)
+            != (16, 16, 128)
+        ):
+            raise ValueError(
+                "Ascend paged prefill requires synchronous single-stream ascend_eager, ordinary "
+                "packed prefill, 16-token pages and Ouro MHA with 16 heads of width 128"
+            )
         ordered_pipeline = (
             speculative_config is not None
             and speculative_config.mode == "pipeline"
@@ -314,6 +331,13 @@ class StageEngine:
             packed_window_shape=packed_window_shape,
             allow_fp8_calibration=True,
         )
+        if self.execution_config.ascend_paged_prefill:
+            from torch_npu import npu_fused_infer_attention_score
+
+            from vllm_rlt.kernels.ascend_attention import AscendPagedPrefill
+
+            attention.packed_pool_prefill = AscendPagedPrefill(npu_fused_infer_attention_score)
+            attention.info["ascend_paged_prefill"] = True
         fp8_scale = None
         if cache_config.kv_cache_dtype == "fp8_e4m3" and not attention.capabilities.fp8_kv:
             fp8_scale = calibrate_fp8_scale(model, cache_config, attention)

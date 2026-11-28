@@ -169,6 +169,8 @@ class ExecutionConfig:
     packed_graph_buckets: bool = False
     # Prepare native Inkling graphs before serving and keep the cache fixed.
     cuda_graph_warmup: bool = False
+    # Use paged TND attention for heterogeneous Ascend prefill batches.
+    ascend_paged_prefill: bool = False
 
     def __post_init__(self):
         if self.packed_prefill is not None and type(self.packed_prefill) is not bool:
@@ -180,6 +182,7 @@ class ExecutionConfig:
             "static_buffers",
             "pad_to_power_of_two",
             "cuda_graphs",
+            "ascend_paged_prefill",
             "packed_graph_buckets",
             "cuda_graph_warmup",
         ):

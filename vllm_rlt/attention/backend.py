@@ -43,6 +43,8 @@ class AttentionBackend:
     kernel: Callable
     capabilities: BackendCapabilities
     info: dict
+    # Optional packed kernel consuming full pools and an explicit model layer.
+    packed_pool_prefill: Callable | None = None
 
     def __call__(self, *args, **kwargs):
         return self.kernel(*args, **kwargs)
