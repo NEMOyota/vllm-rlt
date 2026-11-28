@@ -129,17 +129,12 @@ def test_varlen_pool_attention(device_name, case, spans, fuses):
     assert strategy.calls == (layers if fuses else 0)
 
 
-@pytest.mark.parametrize(
-    "case",
-    ["c4_h1", "mixed", "one_token_suffix", "cold_uniform", "single", "w2_shape", "long_suffix"],
-)
-@torch.inference_mode()
-def test_ouro_scheduler_to_paged_prefill_on_cpu(case, monkeypatch):
+@pytest.fixture
+def cpu_ouro_engine(monkeypatch):
     # Keep the real scheduler, prompt publication, four loops, model layers and decode.
     # Only emulate the device selection and the BF16 FIA operator.
     from dataclasses import replace
 
-    from benchmarks import ascend_varlen_prefill as bench
     from vllm_rlt.engine import stage_engine
     from vllm_rlt.models.ouro import OuroConfig, OuroForCausalLM
 
@@ -165,6 +160,18 @@ def test_ouro_scheduler_to_paged_prefill_on_cpu(case, monkeypatch):
             model, execution_config=replace(execution_config, ascend_paged_prefill=False), **kwargs
         )
 
+    return model, build
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["c4_h1", "mixed", "one_token_suffix", "cold_uniform", "single", "w2_shape", "long_suffix"],
+)
+@torch.inference_mode()
+def test_ouro_scheduler_to_paged_prefill_on_cpu(case, monkeypatch, cpu_ouro_engine):
+    from benchmarks import ascend_varlen_prefill as bench
+
+    model, build = cpu_ouro_engine
     monkeypatch.setattr(bench, "StageEngine", build)
     params = bench.SamplingParams(
         temperature=0, min_loops=4, max_loops=4, max_tokens=2, exit_threshold=1.0, ignore_eos=True
@@ -203,3 +210,23 @@ def test_invalid_paged_prefill_configuration(changes):
                 packed_prefill=changes.get("packed", True),
             ),
         )
+
+
+@pytest.mark.parametrize("hot", [0, 1, 4])
+@torch.inference_mode()
+def test_prefix_benefit_same_backend_queued_and_chunked(hot, monkeypatch, cpu_ouro_engine):
+    from benchmarks import ascend_prefix_benefit as bench
+
+    model, build = cpu_ouro_engine
+    monkeypatch.setattr(bench, "StageEngine", build)
+    shape = bench.Workload(length=64, outputs=2, clients=4, residents=2, prefix=48, hot_clients=hot)
+    off, on = [bench.measure_arm(model, shape, 797543261, 32, enabled) for enabled in (False, True)]
+    assert off["ascend_paged_prefill"] and on["ascend_paged_prefill"]
+    assert off["num_blocks"] == on["num_blocks"]
+    assert off["prefill_rows"] == 256 and on["prefill_rows"] == 256 - hot * 48
+    assert off["hit_tokens"] == 0 and on["hit_tokens"] == hot * 48
+    assert off["output_tokens"] == on["output_tokens"] == 8
+    pair = bench.paired(off, on)
+    both = bench.summary([dict(off=off, on=on, pair=pair)])
+    assert both["on_hit_fraction"] == hot * 48 / 256
+    assert pair["on_with_primer_vs_off_pct"] < pair["output_tok_s_change_pct"]

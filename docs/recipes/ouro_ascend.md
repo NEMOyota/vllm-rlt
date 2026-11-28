@@ -284,3 +284,81 @@ also recorded. A positive TTFT saving means a shorter wait for the first token.
 A positive throughput change means more output tokens delivered per second.
 A mismatch or a dispatch/hit-count failure gives a nonzero exit after saving
 the results. Errors during execution identify the interrupted arm in the JSON.
+
+### Measure prefix-cache benefit on a fixed backend
+
+Both arms of this experiment use synchronous BF16 Ouro, 16-token pages and
+`ascend_paged_prefill=True`. Only `enable_prefix_caching` changes. The same
+dispatch policy can select different kernels as a consequence of cache hits.
+In particular, equal-length cold W2 prompts take batched SDPA, while multiple
+hot suffixes can take paged FIA. The earlier `legacy` versus `paged` comparison
+instead measured the effect of changing the attention implementation with the
+cache already enabled.
+
+This covers ordinary packed prefill on the RLT single-stream engine. In
+vLLM-Ascend, the corresponding backend also has separate cold, cache-hit,
+decode and chunked-prefill states, including dispatch for a mixed prefill/decode
+step and graph replay. Its declared kernel page size at the inspected revision
+is 128. Those additional paths have independent execution requirements.
+[Backend states and page size](https://github.com/vllm-project/vllm-ascend/blob/4098f7a51440bc4e3384cf5a1ff0fc7eba4067a4/vllm_ascend/attention/attention_v1.py#L141-L150)
+· [Mixed-step dispatch](https://github.com/vllm-project/vllm-ascend/blob/4098f7a51440bc4e3384cf5a1ff0fc7eba4067a4/vllm_ascend/attention/attention_v1.py#L1038-L1061)
+· [Graph replay](https://github.com/vllm-project/vllm-ascend/blob/4098f7a51440bc4e3384cf5a1ff0fc7eba4067a4/vllm_ascend/attention/attention_v1.py#L619-L662).
+
+Run in the original CANN environment on each host, using an idle physical card
+and its local Ouro-1.4B checkpoint. Use a new output filename for each run.
+
+```bash
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+ASCEND_RT_VISIBLE_DEVICES=0 python -m benchmarks.ascend_prefix_benefit \
+  --checkpoint "$MODEL" --cases W2-cold W2-quarter W2 --rounds 4 \
+  --seed 797543261 --output results/prefix-benefit-w2.json
+```
+
+| Case | Requests hitting 96 tokens | Target hit tokens / 4096 | Expected target prefill rows with cache |
+| --- | ---: | ---: | ---: |
+| W2-cold | 0 / 32 | 0 | 4096 |
+| W2-quarter | 8 / 32 | 768 | 3328 |
+| W2 | 32 / 32 | 3072 | 1024 |
+
+All three cases generate exactly 4096 output tokens per arm. The default is a
+fixed cohort, timed through drain, with four alternating same-card pairs. The
+engine and KV pool are recreated for each arm, then warmed with disjoint inputs.
+The first pair warms each arm for the complete output length. Later pairs use
+a two-token warmup per engine.
+Both arms run the same donor before measuring the targets. The measured ON
+primer must start cold. A trial checks actual per-request hits, scheduled
+prefill rows and output lengths. Different generated token IDs are counted as
+an observation. OOMs and incomplete requests leave the experiment incomplete.
+
+The JSON contains the per-arm throughput, TTFT P50/P95, TPOT P50, wall time and
+attention API call counts. For each case, read the median of the round-by-round
+ON/OFF throughput changes, its range and the number of faster rounds. The
+primary measurement covers the targets with a resident donor. The companion
+`on_with_primer_vs_off_pct` also charges the ON arm for the complete measured
+donor run, once per cohort. A TTFT improvement can coexist with unchanged or
+lower output throughput.
+
+The same command accepts `--cases W1 W2 W3 W4 W5`. This uses the historical
+PR1 W-series input/output lengths, client counts, resident limits and nominal
+75% shared prefix, with a fixed cohort and an explicit prefill chunk limit
+(default 256). W4 submits 32 clients and admits at most four at a time. To use
+five idle cards concurrently, launch one case per card with its own result file.
+
+```bash
+cases=(W1 W2 W3 W4 W5)
+mkdir -p results/prefix-benefit
+pids=()
+for i in "${!cases[@]}"; do
+  ASCEND_RT_VISIBLE_DEVICES="$i" OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+    python -m benchmarks.ascend_prefix_benefit --checkpoint "$MODEL" \
+    --cases "${cases[i]}" --rounds 4 --seed 797543261 \
+    --output "results/prefix-benefit/${cases[i]}.json" \
+    >"results/prefix-benefit/${cases[i]}.log" 2>&1 &
+  pids+=("$!")
+done
+status=0
+for i in "${!pids[@]}"; do
+  wait "${pids[i]}" || { echo "Review ${cases[i]} on card $i"; status=1; }
+done
+test "$status" -eq 0
+```
