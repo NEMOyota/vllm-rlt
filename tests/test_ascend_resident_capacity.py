@@ -296,3 +296,28 @@ def test_warmup_is_removed_and_only_on_runs_full_primer(monkeypatch, enabled):
         assert not cache._allocations
     finally:
         engine.close()
+
+
+def test_operator_audit_counts_dispatched_shapes_without_replacing_results():
+    from collections import Counter
+    from contextlib import ExitStack
+    from types import SimpleNamespace
+
+    from benchmarks.ascend_resident_observer import audit_attention
+    from vllm_rlt.kernels import ascend_attention
+
+    q = torch.randn(3, 2, 1, 4)
+    k = torch.randn(3, 2, 7, 4)
+    expected = ascend_attention._attend(q, k, k)
+    strategy = SimpleNamespace(fused_attention=lambda q, k, v, **kw: q)
+    counts = Counter()
+    with ExitStack() as stack:
+        audit_attention(stack, strategy, counts)
+        torch.testing.assert_close(ascend_attention._attend(q, k, k), expected)
+        assert (
+            strategy.fused_attention(
+                q, k, k, actual_seq_lengths=[2, 7], actual_seq_lengths_kv=[9, 5]
+            )
+            is q
+        )
+    assert counts == {("sdpa", (1, 1, 1), (7, 7, 7)): 1, ("fia", (2, 5), (9, 5)): 1}

@@ -68,7 +68,7 @@ run01 profile --case hot --groups I --mode profile --rounds 1
 
 - `environment.json` 保存 Git SHA、检查点配置和各权重分片的完整 SHA-256、设备型号、物理编号、环境版本。`config.json` 保存独立参数和所有轮次的执行顺序。
 - 每个臂在 `模式/负载-顺序/seed-*/round-*/组/` 保存 `job.json`、`device.json`、`result.json`、`run.log`。`requests.jsonl` 保留提交、准入、首次 host dispatch、首 token 和完成时间，单位为距本组目标开始的秒，以及每个请求的实际命中、完整输出和退出深度。
-- `steps.jsonl` 给出每步的阶段、请求数、Q 行数、KV 长度、token 预算利用率、FIA 和各类 SDPA 计数。只有 prefill 和 recurrent 会执行 Ouro attention。对观察到的批量 recurrent gather 路径，输出按当步形状估算的**单层 K+V** 字节数；独立 profile 可检查实际分配。
+- `steps.jsonl` 给出每步的阶段、请求数、Q 行数、KV 长度、token 预算利用率、FIA 和各类 SDPA 计数。audit 还在实际 FIA 和 SDPA 调用边界记录每种形状的请求数、Q 行数和次数。FIA 的 KV 长度来自逐序列参数，SDPA 的 KV 宽度包含可能的 padding。只有 prefill 和 recurrent 会执行 Ouro attention。对观察到的批量 recurrent gather 路径，输出按当步形状估算的**单层 K+V** 字节数；独立 profile 可检查实际分配。
 - `residency.jsonl` 按提交、成功准入和释放记录活跃、独占、共享、仅缓存和空闲块。正式轮记下不可变页表引用，计时结束后再按物理页号去重。audit 另外生成 `kv_audit.jsonl`，核对四深度的页号、逻辑前缀、索引引用、请求引用、逐块守恒，并记录发布与淘汰明细。
 - 每臂采用相同 4 条普通计算预热，预热生成 2 token。同步排空后释放预热索引；ON 组执行完整 4096-token donor、生成 1 token。OFF 组的正式 donor 成本为 0。输出 `output_tok_s` 衡量目标组，`inclusive_output_tok_s` 另计本组一次 donor；两者均以目标请求生成的 token 作分子。
 - 等待分为提交到准入的 `queue_*_ms` 和准入到首次执行提交的 `execution_wait_*_ms`。使用 `resident_mean`、`residence_seconds` 和 `steps.jsonl` 确认新增驻留是否变成更大的执行批。对比 `capacity_gap`、`budget_deferrals`、实测命中和 NPU 高水位诊断未达到理论峰值的原因。budget deferrals 为尝试次数，同一请求可以多次等待。

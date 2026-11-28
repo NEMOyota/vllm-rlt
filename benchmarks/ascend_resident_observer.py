@@ -116,6 +116,28 @@ def residency(events, wall, total):
     )
 
 
+def audit_attention(stack, strategy, counts):
+    """Count actual host-side operator arguments; the audit worker owns this process."""
+    from vllm_rlt.kernels import ascend_attention
+
+    sdpa = ascend_attention._attend
+    fia = strategy.fused_attention
+
+    def observe_sdpa(query, key, value, *args, **kwargs):
+        batch, _, q, _ = query.shape
+        counts["sdpa", (q,) * batch, (key.shape[-2],) * batch] += 1
+        return sdpa(query, key, value, *args, **kwargs)
+
+    def observe_fia(query, key, value, **kwargs):
+        ends = kwargs["actual_seq_lengths"]  # host lists supplied by AscendPagedPrefill
+        lengths = tuple(end - start for start, end in zip([0, *ends[:-1]], ends, strict=True))
+        counts["fia", lengths, tuple(kwargs["actual_seq_lengths_kv"])] += 1
+        return fia(query, key, value, **kwargs)
+
+    stack.enter_context(patch.object(ascend_attention, "_attend", observe_sdpa))
+    stack.enter_context(patch.object(strategy, "fused_attention", observe_fia))
+
+
 class Observer:
     """Observers are installed on this engine instance for the target window only."""
 
@@ -133,6 +155,7 @@ class Observer:
         self.events = []
         self.steps = []
         self.counts = Counter(budget_deferrals=0, allocation_failures=0, evicted_entries=0)
+        self.operator_shapes = Counter()
         self.step = None
         self.origin = None
 
@@ -241,6 +264,8 @@ class Observer:
             return submit(batch)
 
         if self.audit_stream:
+            if cache.attention.packed_pool_prefill is not None and cache.backend == "ascend_eager":
+                audit_attention(stack, cache.attention.packed_pool_prefill, self.operator_shapes)
             publish = cache.publish_prefix
 
             def publish_pages(rid, tokens, length, event=None):
@@ -299,11 +324,36 @@ class Observer:
         before = self.counters()
         while self.engine.has_unfinished_requests():
             self.step = None
+            if self.audit_stream:
+                self.operator_shapes.clear()
             outputs = self.engine.step()
             visible = self.now()
             after = self.counters()
             if self.step is not None:
                 self.step["paths"] = {k: after[k] - before[k] for k in before}
+                if self.audit_stream:
+                    self.step["operator_shapes"] = [
+                        dict(
+                            op=op,
+                            batch_size=len(q),
+                            q_rows=sum(q),
+                            q_lengths=q,
+                            kv_extents=kv,
+                            calls=n,
+                        )
+                        for (op, q, kv), n in self.operator_shapes.items()
+                    ]
+                    if self.cache.backend == "ascend_eager":
+                        for op, field in (("fia", "fia_calls"), ("sdpa", "sdpa_calls")):
+                            actual = sum(
+                                n for (name, _, _), n in self.operator_shapes.items() if name == op
+                            )
+                            if actual != self.step["paths"][field]:
+                                raise ValueError(
+                                    f"{op} audit counted {actual} calls; "
+                                    f"backend reported {self.step['paths'][field]}"
+                                )
+
                 # RECURRENT is the attention-bearing decode phase in this Ouro configuration.
                 direct = self.step["phase"] == "recurrent" and self.step["paths"]["ragged_calls"]
                 if direct:
